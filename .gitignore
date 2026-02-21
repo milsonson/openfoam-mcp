@@ -1,0 +1,13 @@
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.log
+
+# OpenFOAM runtime artifacts
+processor*/
+postProcessing/
+*.foam
+
+# OS/editor
+.DS_Store

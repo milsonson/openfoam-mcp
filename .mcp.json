@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "openfoam": {
+      "command": "/home/milsonson/openfoam-mcp/.venv/bin/python",
+      "args": [
+        "/home/milsonson/openfoam-mcp/run_server.py"
+      ]
+    }
+  }
+}
