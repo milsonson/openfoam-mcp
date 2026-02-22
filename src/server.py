@@ -65,6 +65,7 @@ if __package__ in (None, ""):
         openfoam_generate_modeling_plan,
         openfoam_run_workflow_from_prompt,
     )
+    from src.web import cleanup_old_job_dirs, load_server_config, register_custom_routes
 else:
     from .tools import (
         # Input models
@@ -115,9 +116,19 @@ else:
         openfoam_generate_modeling_plan,
         openfoam_run_workflow_from_prompt,
     )
+    from .web import cleanup_old_job_dirs, load_server_config, register_custom_routes
+
+_SERVER_CONFIG = load_server_config()
 
 # Initialize the MCP server
-mcp = FastMCP("openfoam_mcp")
+mcp = FastMCP(
+    "openfoam_mcp",
+    host=_SERVER_CONFIG.host,
+    port=_SERVER_CONFIG.port,
+    sse_path=_SERVER_CONFIG.sse_path,
+    streamable_http_path=_SERVER_CONFIG.streamable_http_path,
+)
+register_custom_routes(mcp)
 
 
 # ============================================================================
@@ -450,7 +461,12 @@ async def run_workflow_from_prompt_tool(params: RunWorkflowFromPromptInput) -> s
 
 def main():
     """Run the MCP server."""
-    mcp.run()
+    _SERVER_CONFIG.artifact_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_old_job_dirs(
+        ttl_seconds=_SERVER_CONFIG.artifact_ttl_seconds,
+        max_jobs=_SERVER_CONFIG.artifact_max_jobs,
+    )
+    mcp.run(transport=_SERVER_CONFIG.transport)
 
 
 if __name__ == "__main__":

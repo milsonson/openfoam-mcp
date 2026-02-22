@@ -86,6 +86,43 @@ openfoam-mcp
 
 按你的实际路径替换 `command` 和 `args`。
 
+### 5.1 传输模式（SSE / Streamable HTTP）
+
+默认支持以下 transport：
+
+- `sse`
+- `streamable-http`
+- `stdio`
+
+常用环境变量：
+
+- `OPENFOAM_MCP_TRANSPORT`：默认 `sse`
+- `OPENFOAM_MCP_HOST`：默认 `127.0.0.1`
+- `OPENFOAM_MCP_PORT`：默认 `8000`（若设置 `PORT` 则可跟随）
+- `OPENFOAM_MCP_SSE_PATH`：默认 `/sse`
+- `OPENFOAM_MCP_STREAMABLE_HTTP_PATH`：默认 `/mcp`
+- `OPENFOAM_MCP_ARTIFACT_DIR`：产物目录（默认 `/tmp/openfoam-mcp-artifacts`）
+- `OPENFOAM_MCP_ARTIFACT_BASE_URL`：下载 URL 前缀（默认推导）
+- `OPENFOAM_MCP_PORTAL_BASE_URL`：Portal URL 前缀（默认推导）
+
+启用 streamable-http 示例：
+
+```bash
+source .venv/bin/activate
+OPENFOAM_MCP_TRANSPORT=streamable-http \
+OPENFOAM_MCP_PORT=8011 \
+python src/server.py
+```
+
+此时常用地址：
+
+- MCP：`http://127.0.0.1:8011/mcp`
+- 健康检查：`http://127.0.0.1:8011/health`
+- Portal：`http://127.0.0.1:8011/portal/<job_id>`
+- Artifact：`http://127.0.0.1:8011/artifacts/<job_id>/<file>`
+- Job 状态：`http://127.0.0.1:8011/jobs/<job_id>/status`
+- Job SSE：`http://127.0.0.1:8011/jobs/<job_id>/events`
+
 ## 6. 快速使用流程
 
 推荐从以下顺序开始：
@@ -254,3 +291,78 @@ openfoam_preflight_check(profile="solver" 或 "parallel")
 表示流程主体已执行，但存在环境缺失、可选阶段跳过或预检告警。  
 请查看返回中的 `warnings` 列表定位具体原因。
 
+## 14. Docker 与 Google Cloud Run 部署
+
+### 14.1 本地构建并运行
+
+```bash
+cd /path/to/openfoam-mcp
+docker build -t openfoam-mcp:latest .
+docker run --rm -p 8080:8080 \
+  -e OPENFOAM_MCP_TRANSPORT=streamable-http \
+  -e OPENFOAM_MCP_ARTIFACT_BASE_URL=http://127.0.0.1:8080/artifacts \
+  -e OPENFOAM_MCP_PORTAL_BASE_URL=http://127.0.0.1:8080/portal \
+  openfoam-mcp:latest
+```
+
+访问：
+
+- 健康检查：`http://127.0.0.1:8080/health`
+- MCP：`http://127.0.0.1:8080/mcp`
+
+### 14.2 部署到 Cloud Run（Artifact Registry）
+
+```bash
+PROJECT_ID="<your-gcp-project-id>"
+REGION="us-central1"
+REPO="openfoam-mcp"
+IMAGE="openfoam-mcp"
+SERVICE="openfoam-mcp"
+
+gcloud config set project "${PROJECT_ID}"
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com
+gcloud artifacts repositories create "${REPO}" \
+  --repository-format=docker \
+  --location="${REGION}" \
+  --description="OpenFOAM MCP images"
+gcloud auth configure-docker "${REGION}-docker.pkg.dev"
+
+IMAGE_URI="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${IMAGE}:latest"
+docker build --platform linux/amd64 -t "${IMAGE_URI}" .
+docker push "${IMAGE_URI}"
+
+gcloud run deploy "${SERVICE}" \
+  --image "${IMAGE_URI}" \
+  --region "${REGION}" \
+  --allow-unauthenticated
+```
+
+回填服务 URL 到 Portal/Artifact 前缀：
+
+```bash
+SERVICE_URL="$(gcloud run services describe "${SERVICE}" --region "${REGION}" --format='value(status.url)')"
+gcloud run services update "${SERVICE}" \
+  --region "${REGION}" \
+  --set-env-vars "OPENFOAM_MCP_TRANSPORT=streamable-http,OPENFOAM_MCP_ARTIFACT_BASE_URL=${SERVICE_URL}/artifacts,OPENFOAM_MCP_PORTAL_BASE_URL=${SERVICE_URL}/portal"
+```
+
+部署完成后：
+
+- MCP URL：`${SERVICE_URL}/mcp`
+- 健康检查：`${SERVICE_URL}/health`
+
+## 15. 生产化演进路线（Roadmap）
+
+当前版本已支持 Cloud Run 服务化与 Portal/Artifact 交付。建议下一阶段按以下路径演进：
+
+1. 可观测性增强
+- 引入 Prometheus 指标（请求量、任务时长、失败率、artifact 生成耗时）
+- 对接 Cloud Monitoring 告警策略（失败率、超时率、实例重启频次）
+
+2. 存储与队列外部化
+- Artifact 从本地目录迁移到 Cloud Storage（GCS Signed URL）
+- 作业状态从本地 manifest 演进到 Redis + Cloud SQL（支持更高并发与恢复）
+
+3. 任务执行架构升级
+- 从同步执行演进为异步队列（submit/status/events）
+- 对重任务场景增加独立 worker 或 GKE Job

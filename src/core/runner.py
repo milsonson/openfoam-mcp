@@ -1,10 +1,11 @@
 """OpenFOAM solver runner and process management."""
 
-from typing import Dict, Any, List, Optional, Callable
+from typing import Dict, List, Optional, Callable
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+import logging
 import subprocess
 import threading
 import queue
@@ -12,6 +13,12 @@ import os
 import re
 import time
 from shutil import which
+
+
+logger = logging.getLogger(__name__)
+DEFAULT_LOG_TAIL_LINES = 50
+ERROR_MESSAGE_MAX_CHARS = 500
+CONVERGENCE_RESIDUAL_THRESHOLD = 1e-3
 
 
 class RunStatus(str, Enum):
@@ -135,6 +142,13 @@ class SolverRunner:
             )
 
         full_command = [resolved_command] + args
+        logger.info(
+            "开始执行命令 command=%s case_path=%s args=%s timeout=%s",
+            command,
+            self.case_path,
+            args,
+            timeout,
+        )
         self._start_time = datetime.now()
         self.progress = RunProgress(status=RunStatus.RUNNING)
         self._stdout_lines = []
@@ -163,6 +177,13 @@ class SolverRunner:
                 for line in self._stdout_lines:
                     self._parse_progress_line(line)
 
+                logger.warning(
+                    "命令执行超时 command=%s case_path=%s timeout=%s",
+                    command,
+                    self.case_path,
+                    timeout,
+                )
+
                 return RunResult(
                     status=RunStatus.FAILED,
                     return_code=-1,
@@ -188,6 +209,13 @@ class SolverRunner:
 
             if self.process.returncode == 0:
                 converged = self._check_convergence(stdout)
+                logger.info(
+                    "命令执行完成 command=%s case_path=%s return_code=0 converged=%s duration=%.3f",
+                    command,
+                    self.case_path,
+                    converged,
+                    duration,
+                )
                 return RunResult(
                     status=RunStatus.COMPLETED,
                     return_code=0,
@@ -199,6 +227,13 @@ class SolverRunner:
                 )
             else:
                 error_msg = self._extract_error_message(stdout + stderr)
+                logger.error(
+                    "命令执行失败 command=%s case_path=%s return_code=%s error=%s",
+                    command,
+                    self.case_path,
+                    self.process.returncode,
+                    error_msg,
+                )
                 return RunResult(
                     status=RunStatus.FAILED,
                     return_code=self.process.returncode,
@@ -314,7 +349,7 @@ class SolverRunner:
 
         return self.progress
 
-    def get_log_tail(self, lines: int = 50) -> str:
+    def get_log_tail(self, lines: int = DEFAULT_LOG_TAIL_LINES) -> str:
         """Get the last N lines of output."""
         all_lines = self._stdout_lines + self._stderr_lines
         return '\n'.join(all_lines[-lines:])
@@ -397,7 +432,7 @@ class SolverRunner:
         if "End" in output and "FOAM FATAL" not in output:
             # Check final residuals
             for field, residual in self.progress.residuals.items():
-                if residual > 1e-3:  # Not well converged
+                if residual > CONVERGENCE_RESIDUAL_THRESHOLD:
                     return False
             return True
         return False
@@ -411,12 +446,12 @@ class SolverRunner:
             re.DOTALL | re.IGNORECASE
         )
         if foam_error:
-            return foam_error.group(1).strip()[:500]
+            return foam_error.group(1).strip()[:ERROR_MESSAGE_MAX_CHARS]
 
         # Look for other errors
         error_match = re.search(r'error[:\s]+(.*)', output, re.IGNORECASE)
         if error_match:
-            return error_match.group(1).strip()[:500]
+            return error_match.group(1).strip()[:ERROR_MESSAGE_MAX_CHARS]
 
         return "未知错误"
 

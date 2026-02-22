@@ -72,7 +72,12 @@ def _upsert_named_block(content: str, block_name: str, entries: list[str]) -> st
 
 
 def _factorize_processors(n_processors: int) -> tuple[int, int, int]:
-    """Factorize processor count into 3 integer axes with exact product."""
+    """Map processor count to a near-balanced 3D decomposition.
+
+    The function greedily distributes prime factors to the smallest axis so that
+    the resulting `(n_x, n_y, n_z)` values remain as balanced as possible while
+    guaranteeing `n_x * n_y * n_z == n_processors`.
+    """
     if n_processors < 1:
         raise ValueError("n_processors 必须 >= 1")
 

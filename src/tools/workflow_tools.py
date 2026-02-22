@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from enum import Enum
+from datetime import datetime, timezone
 from pathlib import Path
 import json
+import logging
 import re
 import shutil
-from typing import Any, Dict, List, Optional
+import uuid
+from typing import Any, Dict, List, NotRequired, Optional, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -25,6 +28,16 @@ from ..core import (
     validate_case,
 )
 from ..templates import get_template
+from ..web.artifacts import (
+    append_job_event,
+    build_artifact_url,
+    create_job_artifact_dir,
+    create_job_bundle,
+    list_job_artifacts,
+    write_job_manifest,
+)
+from ..web.config import load_server_config
+from ..web.events import publish_job_event
 from .case_tools import (
     AnalyzeProblemInput,
     GenerateResidualPlotInput,
@@ -49,6 +62,56 @@ class ResponseFormat(str, Enum):
 
     MARKDOWN = "markdown"
     JSON = "json"
+
+
+logger = logging.getLogger(__name__)
+
+
+class KPISummary(TypedDict):
+    """Key metrics extracted from workflow execution."""
+
+    converged: bool | None
+    final_residuals: dict[str, Any]
+    final_residual_fields: list[str]
+    duration_seconds: float | None
+
+
+class QualityReport(TypedDict):
+    """Consolidated quality checks for portal rendering."""
+
+    preflight_overall: Any
+    preflight_errors: Any
+    preflight_warnings: Any
+    validation_passed: Any
+    validation_has_warnings: Any
+    stability_high_risk_before: Any
+    stability_high_risk_after: Any
+
+
+class WorkflowEvent(TypedDict):
+    """Serializable workflow stage event."""
+
+    job_id: str
+    stage: str
+    status: str
+    message: str
+    timestamp: str
+    progress: NotRequired[int]
+    data: NotRequired[dict[str, Any]]
+
+
+class WorkflowManifest(TypedDict, total=False):
+    """Stored manifest state for a workflow job."""
+
+    contract_version: str
+    job_id: str
+    portal_url: str
+    status: str
+    stage: str
+    progress: int
+    case_path: str
+    created_at: str
+    updated_at: str
 
 
 class GenerateModelingPlanInput(BaseModel):
@@ -253,6 +316,140 @@ def _safe_json_loads(text: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
     return data if isinstance(data, dict) else None
+
+
+def _extract_plot_path_from_output(text: str) -> Optional[Path]:
+    """Extract residual plot file path from markdown tool output."""
+    if not text:
+        return None
+    match = re.search(r"\*\*输出文件\*\*:\s*(.+)", text)
+    if not match:
+        return None
+    plot_path = Path(match.group(1).strip())
+    return plot_path if plot_path.exists() and plot_path.is_file() else None
+
+
+def _build_kpi_summary(solver_run: Dict[str, Any]) -> KPISummary:
+    """Build user-facing KPI summary from solver execution payload."""
+    summary: KPISummary = {
+        "converged": None,
+        "final_residuals": {},
+        "final_residual_fields": [],
+        "duration_seconds": None,
+    }
+
+    solve_payload = solver_run.get("solve") if isinstance(solver_run.get("solve"), dict) else solver_run
+    if not isinstance(solve_payload, dict):
+        return summary
+
+    final_residuals = solve_payload.get("final_residuals")
+    if isinstance(final_residuals, dict):
+        cleaned = {str(k): v for k, v in final_residuals.items()}
+        summary["final_residuals"] = cleaned
+        summary["final_residual_fields"] = sorted(cleaned.keys())
+
+    converged = solve_payload.get("converged")
+    if isinstance(converged, bool):
+        summary["converged"] = converged
+
+    duration_seconds = solve_payload.get("duration_seconds")
+    if isinstance(duration_seconds, (int, float)):
+        summary["duration_seconds"] = float(duration_seconds)
+
+    return summary
+
+
+def _build_quality_report(
+    preflight: Dict[str, Any],
+    validation: Dict[str, Any],
+    stability: Dict[str, Any],
+) -> QualityReport:
+    """Build quality-focused report for portal display."""
+    before = stability.get("before") if isinstance(stability.get("before"), dict) else {}
+    after = stability.get("after") if isinstance(stability.get("after"), dict) else {}
+    return {
+        "preflight_overall": preflight.get("overall"),
+        "preflight_errors": preflight.get("errors"),
+        "preflight_warnings": preflight.get("warnings"),
+        "validation_passed": validation.get("passed"),
+        "validation_has_warnings": validation.get("has_warnings"),
+        "stability_high_risk_before": before.get("high_risk"),
+        "stability_high_risk_after": after.get("high_risk"),
+    }
+
+
+def _write_json(path: Path, payload: Dict[str, Any] | KPISummary | QualityReport) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _build_and_collect_artifacts(
+    *,
+    job_id: str,
+    case_path: str,
+    payload: Dict[str, Any],
+    kpi_summary: KPISummary,
+    quality_report: QualityReport,
+) -> List[Dict[str, Any]]:
+    """Persist workflow artifacts and return downloadable metadata."""
+    job_dir = create_job_artifact_dir(job_id)
+
+    try:
+        create_job_bundle(job_id, case_path)
+    except Exception:
+        payload.setdefault("warnings", []).append("artifact_bundle_failed")
+
+    _write_json(job_dir / "kpi_summary.json", kpi_summary)
+    _write_json(job_dir / "quality_report.json", quality_report)
+
+    final_residuals = kpi_summary.get("final_residuals", {})
+    if isinstance(final_residuals, dict) and final_residuals:
+        lines = ["field,residual"]
+        for field in sorted(final_residuals.keys()):
+            lines.append(f"{field},{final_residuals[field]}")
+        (job_dir / "final_residuals.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    case_dir = Path(case_path)
+    log_files = sorted(
+        [p for p in case_dir.glob("log.*") if p.is_file()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for log_file in log_files[:3]:
+        try:
+            shutil.copy2(log_file, job_dir / log_file.name)
+        except Exception:
+            payload.setdefault("warnings", []).append(f"artifact_copy_failed:{log_file.name}")
+
+    residual_output = payload.get("solver_run", {}).get("residual_plot")
+    if isinstance(residual_output, str):
+        plot_path = _extract_plot_path_from_output(residual_output)
+        if plot_path is not None:
+            try:
+                shutil.copy2(plot_path, job_dir / plot_path.name)
+            except Exception:
+                payload.setdefault("warnings", []).append(f"artifact_copy_failed:{plot_path.name}")
+
+    manifest = {
+        "contract_version": "v1",
+        "job_id": job_id,
+        "status": payload.get("status"),
+        "template_id": payload.get("template_id"),
+        "template_name": payload.get("template_name"),
+        "solver": payload.get("solver"),
+        "warnings": payload.get("warnings", []),
+        "failures": payload.get("failures", []),
+        "kpi_summary": kpi_summary,
+        "quality_report": quality_report,
+    }
+    write_job_manifest(job_id, manifest)
+    artifacts = list_job_artifacts(job_id)
+    manifest["artifacts"] = artifacts
+    write_job_manifest(job_id, manifest)
+    return list_job_artifacts(job_id)
 
 
 def _build_modeling_plan(description: str) -> Dict[str, Any]:
@@ -497,66 +694,181 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
     """
     Execute end-to-end workflow from NL prompt to OpenFOAM case outputs.
     """
+    runtime_config = load_server_config()
+    job_id = uuid.uuid4().hex
+    portal_url = f"{runtime_config.portal_base_url}/{job_id}"
+    create_job_artifact_dir(job_id)
+
+    manifest_state: WorkflowManifest = {
+        "contract_version": "v1",
+        "job_id": job_id,
+        "portal_url": portal_url,
+        "status": "running",
+        "stage": "planning",
+        "progress": 0,
+        "case_path": params.case_path,
+        "created_at": _utc_now_iso(),
+    }
+    write_job_manifest(job_id, manifest_state)
+
+    def _emit_event(
+        *,
+        stage: str,
+        status: str,
+        message: str,
+        progress: Optional[int] = None,
+        data: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        event: WorkflowEvent = {
+            "job_id": job_id,
+            "stage": stage,
+            "status": status,
+            "message": message,
+            "timestamp": _utc_now_iso(),
+        }
+        if progress is not None:
+            event["progress"] = int(progress)
+        if data:
+            event["data"] = data
+
+        try:
+            append_job_event(job_id, event)
+            publish_job_event(job_id, json.dumps(event, ensure_ascii=False))
+        except Exception as exc:
+            logger.warning(
+                "作业事件写入失败，已降级继续执行 job_id=%s stage=%s status=%s error=%s",
+                job_id,
+                stage,
+                status,
+                exc,
+            )
+
+        logger.info(
+            "作业阶段更新 job_id=%s stage=%s status=%s progress=%s message=%s",
+            job_id,
+            stage,
+            status,
+            progress,
+            message,
+        )
+
+        manifest_state["stage"] = stage
+        manifest_state["status"] = status
+        manifest_state["updated_at"] = event["timestamp"]
+        if progress is not None:
+            manifest_state["progress"] = int(progress)
+        write_job_manifest(job_id, manifest_state)
+
+    def _with_common_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
+        payload["contract_version"] = "v1"
+        payload["job_id"] = job_id
+        payload["portal_url"] = portal_url
+        payload["manifest_url"] = build_artifact_url(f"{job_id}/manifest.json")
+        return payload
+
+    _emit_event(stage="planning", status="running", message="开始分析建模需求", progress=5)
     plan = _build_modeling_plan(params.description)
     if plan.get("status") == "error":
+        _emit_event(
+            stage="planning",
+            status="failed",
+            message=plan.get("message", "规划失败"),
+            progress=100,
+        )
+        base_payload = _with_common_fields(
+            {
+                "status": "failed",
+                "stage": "planning",
+                "error": plan.get("message", "规划失败"),
+                "plan": plan,
+            }
+        )
+        base_payload["artifacts"] = list_job_artifacts(job_id)
+        manifest_state.update(base_payload)
+        write_job_manifest(job_id, manifest_state)
         if params.response_format == ResponseFormat.JSON:
-            return json.dumps(
-                {
-                    "status": "failed",
-                    "stage": "planning",
-                    "error": plan.get("message", "规划失败"),
-                    "plan": plan,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
+            return json.dumps(base_payload, ensure_ascii=False, indent=2)
         return f"错误: {plan.get('message', '规划失败')}"
 
     if plan.get("status") != "ready":
+        _emit_event(
+            stage="planning",
+            status="needs_input",
+            message="需要更多信息以继续建模",
+            progress=100,
+            data={"classification_status": plan.get("classification_status")},
+        )
+        base_payload = _with_common_fields(
+            {
+                "status": "needs_input",
+                "stage": "planning",
+                "plan": plan,
+            }
+        )
+        base_payload["artifacts"] = list_job_artifacts(job_id)
+        manifest_state.update(base_payload)
+        write_job_manifest(job_id, manifest_state)
         if params.response_format == ResponseFormat.JSON:
-            return json.dumps(
-                {
-                    "status": "needs_input",
-                    "stage": "planning",
-                    "plan": plan,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
+            return json.dumps(base_payload, ensure_ascii=False, indent=2)
         return _format_plan_markdown(plan)
+
+    _emit_event(
+        stage="planning",
+        status="running",
+        message="建模计划已确认",
+        progress=15,
+        data={"template_id": plan.get("template_id")},
+    )
 
     case_path = Path(params.case_path)
     case_existed = case_path.exists()
+    _emit_event(stage="create_case", status="running", message="开始生成案例文件", progress=20)
     case_path.mkdir(parents=True, exist_ok=True)
 
     template_id = str(plan["template_id"])
     plan_parameters = dict(plan["parameters"])
 
     try:
-        config = create_case_config_from_template(
+        case_config = create_case_config_from_template(
             template_id=template_id,
             parameters=plan_parameters,
             case_path=params.case_path,
         )
-        generator = OpenFOAMGenerator(config)
+        generator = OpenFOAMGenerator(case_config)
         created_files = generator.write_case()
     except Exception as exc:
         if not case_existed and case_path.exists():
             shutil.rmtree(case_path, ignore_errors=True)
+        _emit_event(
+            stage="create_case",
+            status="failed",
+            message=f"创建案例失败: {exc}",
+            progress=100,
+        )
+        base_payload = _with_common_fields(
+            {
+                "status": "failed",
+                "stage": "create_case",
+                "case_path": params.case_path,
+                "template_id": template_id,
+                "error": str(exc),
+                "plan": plan,
+            }
+        )
+        base_payload["artifacts"] = list_job_artifacts(job_id)
+        manifest_state.update(base_payload)
+        write_job_manifest(job_id, manifest_state)
         if params.response_format == ResponseFormat.JSON:
-            return json.dumps(
-                {
-                    "status": "failed",
-                    "stage": "create_case",
-                    "case_path": params.case_path,
-                    "template_id": template_id,
-                    "error": str(exc),
-                    "plan": plan,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
+            return json.dumps(base_payload, ensure_ascii=False, indent=2)
         return f"创建案例失败: {exc}"
+
+    _emit_event(
+        stage="create_case",
+        status="running",
+        message="案例文件生成完成",
+        progress=30,
+        data={"created_files": len(created_files)},
+    )
 
     preflight_profile = "diagnostic"
     if params.run_solver and params.run_parallel:
@@ -566,10 +878,16 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
     elif params.run_mesh:
         preflight_profile = "mesh"
 
+    _emit_event(
+        stage="preflight",
+        status="running",
+        message=f"执行预检查（{preflight_profile}）",
+        progress=35,
+    )
     preflight_report = openfoam_preflight_check(
         PreflightCheckInput(
             case_path=params.case_path,
-            solver=config.solver,
+            solver=case_config.solver,
             n_processors=params.n_processors if params.run_parallel else None,
             profile=preflight_profile,
             strict=False,
@@ -577,12 +895,25 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
         )
     )
     preflight_summary = _summarize_preflight(preflight_report)
+    _emit_event(
+        stage="preflight",
+        status="running",
+        message="预检查完成",
+        progress=40,
+        data={
+            "errors": preflight_summary.get("errors"),
+            "warnings": preflight_summary.get("warnings"),
+        },
+    )
 
+    _emit_event(stage="validation", status="running", message="执行案例验证", progress=45)
     validation = validate_case(
         case_path=params.case_path,
         run_openfoam=params.run_openfoam_validation,
     )
+    _emit_event(stage="validation", status="running", message="案例验证完成", progress=50)
 
+    _emit_event(stage="stability", status="running", message="评估数值稳定性", progress=55)
     stability_before_raw = openfoam_assess_case_stability(
         AssessCaseStabilityInput(
             case_path=params.case_path,
@@ -610,9 +941,11 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
             )
         )
         stability_after = _safe_json_loads(stability_after_raw)
+    _emit_event(stage="stability", status="running", message="稳定性检查完成", progress=60)
 
     mesh_result: Dict[str, Any] = {"status": "skipped", "reason": "run_mesh=false"}
     if params.run_mesh:
+        _emit_event(stage="mesh", status="running", message="开始网格阶段", progress=65)
         block_mesh_cmd = resolve_openfoam_command("blockMesh")
         check_mesh_cmd = resolve_openfoam_command("checkMesh")
         if block_mesh_cmd:
@@ -629,10 +962,18 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
                 "status": "skipped",
                 "reason": "blockMesh 不可用，请先加载 OpenFOAM 环境",
             }
+        _emit_event(
+            stage="mesh",
+            status="running",
+            message="网格阶段完成",
+            progress=70,
+            data={"status": mesh_result.get("status")},
+        )
 
     solver_result: Dict[str, Any] = {"status": "skipped", "reason": "run_solver=false"}
     if params.run_solver:
-        solver_cmd = resolve_openfoam_command(config.solver)
+        _emit_event(stage="solver", status="running", message="开始求解阶段", progress=75)
+        solver_cmd = resolve_openfoam_command(case_config.solver)
         mpirun_cmd = resolve_openfoam_command("mpirun")
         decompose_cmd = resolve_openfoam_command("decomposePar")
         reconstruct_cmd = resolve_openfoam_command("reconstructPar")
@@ -683,7 +1024,7 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
             else:
                 solver_result = {
                     "status": "skipped",
-                    "reason": f"求解器命令不可用: {config.solver}",
+                    "reason": f"求解器命令不可用: {case_config.solver}",
                 }
 
         if (
@@ -693,6 +1034,13 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
             solver_result["residual_plot"] = openfoam_generate_residual_plot(
                 GenerateResidualPlotInput(case_path=params.case_path)
             )
+        _emit_event(
+            stage="solver",
+            status="running",
+            message="求解阶段完成",
+            progress=85,
+            data={"status": solver_result.get("status")},
+        )
 
     status = "completed"
     warning_reasons: List[str] = []
@@ -722,13 +1070,14 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
 
     payload: Dict[str, Any] = {
         "status": status,
+        "stage": "completed",
         "case_path": params.case_path,
         "template_id": template_id,
         "template_name": plan.get("template_name"),
         "classification_status": plan.get("classification_status"),
         "confidence": plan.get("confidence"),
         "candidate_templates": plan.get("candidate_templates", []),
-        "solver": config.solver,
+        "solver": case_config.solver,
         "parameters": plan_parameters,
         "auto_filled": plan.get("auto_filled", {}),
         "created_files": len(created_files),
@@ -749,6 +1098,45 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
         "failures": failure_reasons,
     }
 
+    _emit_event(
+        stage="postprocess",
+        status="running",
+        message="整理交付产物",
+        progress=90,
+    )
+
+    kpi_summary = _build_kpi_summary(payload["solver_run"])
+    quality_report = _build_quality_report(
+        preflight=payload["preflight"],
+        validation=payload["validation"],
+        stability=payload["stability"],
+    )
+    artifacts = _build_and_collect_artifacts(
+        job_id=job_id,
+        case_path=params.case_path,
+        payload=payload,
+        kpi_summary=kpi_summary,
+        quality_report=quality_report,
+    )
+
+    payload = _with_common_fields(payload)
+    payload["artifacts"] = artifacts
+    payload["kpi_summary"] = kpi_summary
+    payload["quality_report"] = quality_report
+
+    manifest_state.update(payload)
+    write_job_manifest(job_id, manifest_state)
+    _emit_event(
+        stage="completed",
+        status=status,
+        message="工作流执行完成",
+        progress=100,
+        data={"artifacts": len(artifacts)},
+    )
+    payload["artifacts"] = list_job_artifacts(job_id)
+    manifest_state["artifacts"] = payload["artifacts"]
+    write_job_manifest(job_id, manifest_state)
+
     if params.response_format == ResponseFormat.JSON:
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -759,7 +1147,10 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
         f"- 案例目录: `{payload['case_path']}`",
         f"- 模板: `{payload['template_id']}` ({payload['template_name']})",
         f"- 求解器: `{payload['solver']}`",
+        f"- Job ID: `{payload['job_id']}`",
+        f"- Portal: {payload['portal_url']}",
         f"- 生成文件数: {payload['created_files']}",
+        f"- 交付产物数: {len(payload['artifacts'])}",
         "",
         "## 预检查",
         f"- 错误: {payload['preflight']['errors']}",
