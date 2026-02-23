@@ -113,6 +113,20 @@ def test_run_solver_rejects_invalid_solver_name(tmp_path: Path) -> None:
     assert "非法求解器名称" in result
 
 
+def test_run_solver_rejects_solver_not_in_allowlist(tmp_path: Path) -> None:
+    case_path = tmp_path / "case_disallowed_solver"
+    _create_case(case_path)
+
+    result = openfoam_run_solver(
+        RunSolverInput(
+            case_path=str(case_path),
+            solver="python3",
+            timeout=120,
+        )
+    )
+    assert "不在允许求解器列表" in result
+
+
 def test_run_parallel_auto_mesh_and_fallback_to_serial_when_parallel_deps_missing(
     tmp_path: Path,
     monkeypatch,

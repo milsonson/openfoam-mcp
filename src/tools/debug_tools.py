@@ -5,6 +5,10 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from .path_utils import atomic_write_text, resolve_within_root, validate_allowed_case_path
 
+
+_SAFE_DICT_VALUE_RE = re.compile(r"^[^\r\n{};]+$")
+MAX_READ_DICTIONARY_BYTES = 2 * 1024 * 1024
+
 # ============================================================================ 
 # Input Models
 # ============================================================================ 
@@ -56,6 +60,8 @@ def _normalize_dictionary_value_for_update(key: str, value: Any) -> str:
         value_text = str(value)
     if "\n" in value_text or "\r" in value_text:
         raise ValueError(f"更新值包含换行符，已拒绝: {key}")
+    if not _SAFE_DICT_VALUE_RE.fullmatch(value_text):
+        raise ValueError(f"更新值包含非法字符（花括号/分号），已拒绝: {key}")
     return value_text
 
 
@@ -157,6 +163,13 @@ def openfoam_read_dictionary(params: ReadDictionaryInput) -> str:
         return f"错误: 字典文件不存在: {file_path}"
         
     try:
+        size_bytes = file_path.stat().st_size
+        if size_bytes > MAX_READ_DICTIONARY_BYTES:
+            return (
+                f"错误: 字典文件过大（{size_bytes} 字节），超过限制 "
+                f"{MAX_READ_DICTIONARY_BYTES} 字节"
+            )
+
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
             content = f.read()
         
@@ -193,11 +206,14 @@ def openfoam_update_dictionary(params: UpdateDictionaryInput) -> str:
         
         for line in lines:
             new_line = line
+            if line.lstrip().startswith("//"):
+                new_lines.append(new_line)
+                continue
             for key, value in params.updates.items():
                 # Match "key value;" or "key (value);"
                 # Regex looks for key at start of line (optional whitespace), 
                 # followed by some whitespace, then any value until a semicolon.
-                pattern = rf'^(\s*{re.escape(key)}\s+)([^;]+)(;.*)$'
+                pattern = rf'^(\s*{re.escape(key)}\b\s+)([^;]+)(;.*)$'
                 match = re.match(pattern, line)
                 if match:
                     val_str = _normalize_dictionary_value_for_update(key, value)

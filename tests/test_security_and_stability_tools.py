@@ -13,7 +13,7 @@ import pytest
 # Ensure repo root is importable when running this test file directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.core.parallel import _generate_decompose_par_dict_content, decompose_case
+from src.core.parallel import _generate_decompose_par_dict_content, decompose_case, run_parallel
 from src.core.runner import RunResult, RunStatus
 from src.tools.case_tools import (
     CalculateYplusInput,
@@ -367,6 +367,47 @@ def test_generate_boundary_conditions_rejects_unsafe_extra_property(tmp_path: Pa
     assert "附加属性值包含非法字符" in bad_val_result
 
 
+def test_generate_boundary_conditions_rejects_unsafe_field_name(tmp_path: Path):
+    """Field file name must be a safe token (no path traversal)."""
+    case_path = tmp_path / "case_bc_field_name"
+    case_path.mkdir(parents=True, exist_ok=True)
+
+    with pytest.raises(ValueError, match="field_name"):
+        GenerateBoundaryConditionsInput(
+            case_path=str(case_path),
+            field_name="../../../../tmp/pwned",
+            boundary_definitions={"inlet": {"type": "fixedValue", "value": "0"}},
+        )
+
+
+def test_generate_boundary_conditions_rejects_boundary_name_injection(tmp_path: Path):
+    """Boundary patch names must reject injected braces/newlines."""
+    case_path = tmp_path / "case_bc_boundary_name"
+    case_path.mkdir(parents=True, exist_ok=True)
+
+    with pytest.raises(ValueError, match="非法边界名称"):
+        GenerateBoundaryConditionsInput(
+            case_path=str(case_path),
+            field_name="U",
+            boundary_definitions={"inlet\n}\nmalicious": {"type": "fixedValue", "value": "(1 0 0)"}},
+        )
+
+
+def test_generate_boundary_conditions_rejects_scalar_injection_value(tmp_path: Path):
+    """Scalar boundary values should reject config-injection separators."""
+    case_path = tmp_path / "case_bc_scalar_inject"
+    case_path.mkdir(parents=True, exist_ok=True)
+
+    result = openfoam_generate_boundary_conditions(
+        GenerateBoundaryConditionsInput(
+            case_path=str(case_path),
+            field_name="p",
+            boundary_definitions={"inlet": {"type": "fixedValue", "value": "0; bad"}},
+        )
+    )
+    assert "标量场边界值包含非法字符" in result
+
+
 def test_generate_mesh_uses_atomic_write_for_block_mesh_updates(tmp_path: Path, monkeypatch):
     """Mesh generator should write blockMeshDict via atomic helper."""
     case_path = tmp_path / "mesh_case"
@@ -597,6 +638,56 @@ def test_decompose_case_switch_to_scotch_adds_scotch_coeffs(tmp_path: Path, monk
     assert "simpleCoeffs" not in updated
 
 
+def test_core_run_parallel_rejects_invalid_solver_argument(tmp_path: Path) -> None:
+    """run_parallel should block malformed solver arguments before mpirun execution."""
+    case_path = tmp_path / "parallel_solver_guard"
+    _create_min_case(case_path)
+
+    with pytest.raises(ValueError, match="solver"):
+        run_parallel(
+            case_path=str(case_path),
+            solver="-x",
+            n_processors=2,
+        )
+
+
+def test_core_run_parallel_rejects_hostfile_outside_case(tmp_path: Path) -> None:
+    """run_parallel hostfile path must stay within case directory."""
+    case_path = tmp_path / "parallel_hostfile_guard"
+    _create_min_case(case_path)
+
+    outside_hostfile = tmp_path.parent / "hostfile.outside"
+    outside_hostfile.write_text("localhost slots=4\n", encoding="utf-8")
+    try:
+        with pytest.raises(ValueError, match="案例目录内"):
+            run_parallel(
+                case_path=str(case_path),
+                solver="simpleFoam",
+                n_processors=2,
+                hostfile=str(outside_hostfile),
+            )
+    finally:
+        outside_hostfile.unlink(missing_ok=True)
+
+
+def test_core_run_parallel_rejects_symlink_hostfile(tmp_path: Path) -> None:
+    """Symlink hostfiles should be rejected even if placed under case directory."""
+    case_path = tmp_path / "parallel_hostfile_symlink"
+    _create_min_case(case_path)
+
+    outside_hostfile = tmp_path / "outside.hosts"
+    outside_hostfile.write_text("localhost slots=2\n", encoding="utf-8")
+    symlink_path = case_path / "hosts.link"
+    symlink_path.symlink_to(outside_hostfile)
+    with pytest.raises(ValueError, match="符号链接"):
+        run_parallel(
+            case_path=str(case_path),
+            solver="simpleFoam",
+            n_processors=2,
+            hostfile="hosts.link",
+        )
+
+
 def test_openfoam_generate_residual_plot_reuses_core_postprocess(tmp_path: Path, monkeypatch):
     """Tool residual plotting should rely on shared core postprocess helpers."""
     case_path = tmp_path / "plot_case"
@@ -639,6 +730,31 @@ def test_openfoam_generate_residual_plot_reuses_core_postprocess(tmp_path: Path,
     assert called["plot"]["output_path"] == str(output_path)
 
 
+def test_generate_residual_plot_rejects_path_escape(tmp_path: Path, monkeypatch) -> None:
+    """Residual plot output_path must stay within case directory."""
+    case_path = tmp_path / "plot_escape_case"
+    case_path.mkdir(parents=True, exist_ok=True)
+    (case_path / "log.simpleFoam").write_text("dummy\n", encoding="utf-8")
+    monkeypatch.setattr("src.tools.case_tools.parse_log_file", lambda _path: {"p": object()})
+    monkeypatch.setattr(
+        "src.tools.case_tools.core_generate_residual_plot",
+        lambda **_kwargs: None,
+    )
+
+    escaped = tmp_path.parent / "outside.png"
+
+    result = openfoam_generate_residual_plot(
+        GenerateResidualPlotInput(
+            case_path=str(case_path),
+            output_path="../../outside.png",
+        )
+    )
+
+    assert "output_path" in result
+    assert "案例目录内" in result
+    assert not escaped.exists()
+
+
 def test_preflight_check_reports_sections(tmp_path: Path):
     """Preflight check should include command and case checks."""
     case_path = tmp_path / "case"
@@ -678,6 +794,50 @@ def test_preflight_check_supports_json_response(tmp_path: Path):
     assert isinstance(payload["env_checks"], list)
     assert isinstance(payload["command_checks"], list)
     assert isinstance(payload["case_checks"], list)
+
+
+def test_preflight_input_rejects_invalid_solver_name() -> None:
+    """Preflight solver must be validated as a safe command token."""
+    with pytest.raises(ValueError, match="非法求解器名称"):
+        PreflightCheckInput(solver="simpleFoam;rm -rf /")
+
+
+def test_update_dictionary_rejects_injection_separators(tmp_path: Path):
+    """Dictionary updates should reject separators that can inject extra entries."""
+    case_path = tmp_path / "case_update_separators"
+    (case_path / "system").mkdir(parents=True, exist_ok=True)
+    dict_path = case_path / "system" / "controlDict"
+    dict_path.write_text("endTime 10;\n", encoding="utf-8")
+
+    result = openfoam_update_dictionary(
+        UpdateDictionaryInput(
+            case_path=str(case_path),
+            dict_path="system/controlDict",
+            updates={"endTime": "20; writeInterval 1"},
+        )
+    )
+    assert "非法字符" in result
+
+
+def test_update_dictionary_uses_word_boundary_for_keys(tmp_path: Path):
+    """Updating key 'p' should not accidentally match 'pressure'."""
+    case_path = tmp_path / "case_update_word_boundary"
+    (case_path / "system").mkdir(parents=True, exist_ok=True)
+    dict_path = case_path / "system" / "controlDict"
+    dict_path.write_text("pressure 100;\np 0;\n", encoding="utf-8")
+
+    result = openfoam_update_dictionary(
+        UpdateDictionaryInput(
+            case_path=str(case_path),
+            dict_path="system/controlDict",
+            updates={"p": 5},
+        )
+    )
+
+    assert "成功更新" in result
+    content = dict_path.read_text(encoding="utf-8")
+    assert "pressure 100;" in content
+    assert "\np 5;\n" in content
 
 
 def test_search_tutorials_respects_max_results(tmp_path: Path, monkeypatch):

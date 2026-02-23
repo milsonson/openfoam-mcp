@@ -44,3 +44,29 @@ def test_workflow_returns_portal_and_artifacts(monkeypatch, tmp_path: Path) -> N
     assert (artifact_root / job_id / "kpi_summary.json").exists()
     assert (artifact_root / job_id / "quality_report.json").exists()
     assert (artifact_root / job_id / "case_bundle.tar.gz").exists()
+
+
+def test_workflow_auto_allocates_case_path_when_omitted(monkeypatch, tmp_path: Path) -> None:
+    artifact_root = tmp_path / "artifacts"
+    monkeypatch.setenv("OPENFOAM_MCP_ARTIFACT_DIR", str(artifact_root))
+    monkeypatch.setenv("OPENFOAM_MCP_ARTIFACT_BASE_URL", "http://localhost:8080/artifacts")
+    monkeypatch.setenv("OPENFOAM_MCP_PORTAL_BASE_URL", "http://localhost:8080/portal")
+    monkeypatch.setenv("OPENFOAM_MCP_ALLOWED_CASE_ROOTS", str(tmp_path))
+
+    result = openfoam_run_workflow_from_prompt(
+        RunWorkflowFromPromptInput(
+            description="模拟水在直径5cm、长度50cm的管道中以1m/s流动",
+            run_mesh=False,
+            run_solver=False,
+            auto_apply_stability_fixes=True,
+            response_format="json",
+        )
+    )
+    payload = json.loads(result)
+
+    auto_case_path = Path(payload["case_path"])
+    assert auto_case_path.is_absolute()
+    assert auto_case_path.exists()
+    assert auto_case_path.is_dir()
+    assert str(auto_case_path).startswith(str(tmp_path))
+    assert payload["delivery_url"].startswith("http://localhost:8080/portal/")

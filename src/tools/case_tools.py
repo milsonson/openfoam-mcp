@@ -4,12 +4,14 @@ from typing import Optional, Dict, Any
 from enum import Enum
 from pathlib import Path
 import shutil
+import os
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 import json
 import re
 
 from .path_utils import (
     atomic_write_text,
+    resolve_within_root,
     resolve_openfoam_command,
     validate_allowed_case_path,
 )
@@ -48,6 +50,8 @@ from ..knowledge import (
 # Character limit for responses
 CHARACTER_LIMIT = 25000
 _SAFE_SOLVER_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*$")
+_SAFE_FIELD_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+_SAFE_BOUNDARY_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SAFE_BC_EXTRA_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SAFE_BC_EXTRA_VALUE_RE = re.compile(r"^[^\r\n{};]+$")
 
@@ -67,12 +71,39 @@ def _validate_allowed_case_path(case_path: str) -> str:
     return validate_allowed_case_path(case_path)
 
 
+def _allowed_solver_name_map() -> dict[str, str]:
+    """Build case-tool solver allowlist from templates plus optional env extension."""
+    allowed: dict[str, str] = {}
+
+    for template in get_all_templates():
+        solver = str(template.solver).strip()
+        if _SAFE_SOLVER_NAME_RE.fullmatch(solver):
+            allowed[solver.lower()] = solver
+
+    extra = os.getenv("OPENFOAM_MCP_ALLOWED_SOLVERS", "")
+    for token in extra.split(","):
+        name = token.strip()
+        if not name:
+            continue
+        if _SAFE_SOLVER_NAME_RE.fullmatch(name):
+            allowed[name.lower()] = name
+
+    return allowed
+
+
 def _validate_solver_name(solver: str) -> str:
-    """Validate solver token to avoid unexpected command execution."""
+    """Validate solver token and enforce allowlist."""
     name = solver.strip()
     if not _SAFE_SOLVER_NAME_RE.fullmatch(name):
         raise ValueError(f"非法求解器名称: {solver}")
-    return name
+
+    allowed = _allowed_solver_name_map()
+    canonical = allowed.get(name.lower())
+    if not canonical:
+        sample = ", ".join(sorted(set(allowed.values())))
+        raise ValueError(f"求解器不在允许求解器列表: {name}。允许项: {sample}")
+
+    return canonical
 
 
 def _build_openfoam_header(class_type: str, object_name: str) -> str:
@@ -129,6 +160,10 @@ def _normalize_boundary_value(raw_value: Any, class_type: str) -> str:
     value_text = str(raw_value).strip()
     if value_text.startswith("(") and value_text.endswith(")"):
         raise ValueError(f"标量场边界值不能是向量形式: {raw_value}")
+    if not _SAFE_BC_EXTRA_VALUE_RE.fullmatch(value_text):
+        raise ValueError(
+            f"标量场边界值包含非法字符（换行/花括号/分号）: {raw_value}"
+        )
     return value_text
 
 
@@ -463,6 +498,23 @@ class GenerateBoundaryConditionsInput(BaseModel):
     @classmethod
     def validate_path(cls, v: str) -> str:
         return _validate_allowed_case_path(v)
+
+    @field_validator("field_name")
+    @classmethod
+    def validate_field_name(cls, v: str) -> str:
+        value = v.strip()
+        if not _SAFE_FIELD_NAME_RE.fullmatch(value):
+            raise ValueError("field_name 非法，仅允许字母开头+字母数字下划线")
+        return value
+
+    @field_validator("boundary_definitions")
+    @classmethod
+    def validate_boundary_names(cls, v: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        for name in v.keys():
+            key = str(name).strip()
+            if not _SAFE_BOUNDARY_NAME_RE.fullmatch(key):
+                raise ValueError(f"非法边界名称: {name}")
+        return v
 
 
 class RunParallelInput(BaseModel):
@@ -1351,6 +1403,8 @@ def openfoam_generate_boundary_conditions(params: GenerateBoundaryConditionsInpu
 
         # Add boundary conditions
         for boundary_name, bc_def in params.boundary_definitions.items():
+            if not _SAFE_BOUNDARY_NAME_RE.fullmatch(boundary_name):
+                return _truncate(f"生成边界条件时发生错误: 非法边界名称: {boundary_name}")
             content += f"    {boundary_name}\n"
             content += "    {\n"
 
@@ -1426,11 +1480,17 @@ def openfoam_get_run_status(params: GetRunStatusInput) -> str:
             return "未找到日志文件。求解器可能尚未运行。"
 
         # Use the most recent log file
-        log_file = max(log_files, key=lambda p: p.stat().st_mtime)
+        try:
+            log_file = max(log_files, key=lambda p: p.stat().st_mtime)
+        except (FileNotFoundError, OSError):
+            return "错误: 日志文件在读取过程中发生变化，请重试"
 
         # Read log file
-        with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
-            lines = f.readlines()
+        try:
+            with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            return "错误: 日志文件在读取过程中被移除，请重试"
 
         # Get last N lines
         recent_lines = lines[-params.log_lines:]
@@ -1467,12 +1527,19 @@ def openfoam_get_run_status(params: GetRunStatusInput) -> str:
                     status_info["residuals"][field] = []
                 status_info["residuals"][field].append(residual)
 
-            # Check for errors
-            if "FOAM FATAL" in line or "error" in line.lower():
+            # Check for errors (keep conservative patterns to reduce false positives)
+            stripped = line.strip()
+            lowered = stripped.lower()
+            if (
+                "foam fatal" in lowered
+                or "floating point exception" in lowered
+                or "segmentation fault" in lowered
+                or re.search(r"^error\s*[:=]", lowered)
+            ):
                 status_info["errors"].append(line.strip())
 
             # Check for completion
-            if "End" in line or "Finalising parallel run" in line:
+            if lowered in {"end", "finalising parallel run"}:
                 status_info["completed"] = True
 
         # Format output
@@ -1753,6 +1820,21 @@ def openfoam_generate_residual_plot(params: GenerateResidualPlotInput) -> str:
     """
     try:
         case_path = Path(params.case_path)
+        if params.output_path:
+            output_candidate = Path(params.output_path).expanduser()
+            if output_candidate.is_absolute():
+                output_file = output_candidate.resolve()
+                try:
+                    output_file.relative_to(case_path.resolve())
+                except ValueError:
+                    return "错误: output_path 必须位于案例目录内"
+            else:
+                try:
+                    output_file = resolve_within_root(case_path, params.output_path, "output_path")
+                except ValueError as exc:
+                    return f"错误: {exc}"
+        else:
+            output_file = case_path / "residuals.png"
 
         log_files = list(case_path.glob("log.*"))
         if not log_files:
@@ -1762,11 +1844,6 @@ def openfoam_generate_residual_plot(params: GenerateResidualPlotInput) -> str:
         residuals_data = parse_log_file(str(log_file))
         if not residuals_data:
             return "错误: 未在日志文件中找到残差数据"
-
-        if params.output_path:
-            output_file = Path(params.output_path)
-        else:
-            output_file = case_path / "residuals.png"
 
         output_file.parent.mkdir(parents=True, exist_ok=True)
         core_generate_residual_plot(

@@ -61,6 +61,13 @@ class PreflightCheckInput(BaseModel):
             return value
         return validate_allowed_case_path(value)
 
+    @field_validator("solver")
+    @classmethod
+    def validate_solver(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        return _validate_solver_name(value)
+
 
 class AssessCaseStabilityInput(BaseModel):
     """Input for case numerical-stability assessment."""
@@ -114,6 +121,17 @@ _STEADY_SOLVERS = {
     "simplefoam",
     "buoyantsimplefoam",
 }
+
+_SAFE_SOLVER_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*$")
+_FLOAT_COMPARE_EPS = 1e-9
+
+
+def _validate_solver_name(solver: str) -> str:
+    """Validate solver token to avoid unexpected command execution."""
+    name = solver.strip()
+    if not _SAFE_SOLVER_NAME_RE.fullmatch(name):
+        raise ValueError(f"非法求解器名称: {solver}")
+    return name
 
 
 def _extract_scalar_value(content: str, key: str) -> Optional[float]:
@@ -521,7 +539,7 @@ def openfoam_assess_case_stability(params: AssessCaseStabilityInput) -> str:
                 "未设置 maxCo",
                 suggestion="建议设置 maxCo ≤ 1（VOF 常用更小值）",
             )
-        elif max_co > 1.0:
+        elif max_co > 1.0 + _FLOAT_COMPARE_EPS:
             _add_check(
                 checks,
                 "warning",
@@ -542,7 +560,7 @@ def openfoam_assess_case_stability(params: AssessCaseStabilityInput) -> str:
                     "interFoam 建议设置 maxAlphaCo",
                     suggestion="建议设置 maxAlphaCo ≤ 1 以控制界面推进稳定性",
                 )
-            elif max_alpha_co > 1.0:
+            elif max_alpha_co > 1.0 + _FLOAT_COMPARE_EPS:
                 _add_check(
                     checks,
                     "warning",

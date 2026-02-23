@@ -5,6 +5,7 @@ from pathlib import Path
 from dataclasses import dataclass
 import os
 
+from ..io_utils import atomic_write_text
 from ..knowledge import (
     FlowType, TimeType, TurbulenceType,
     select_solver, estimate_reynolds_number, recommend_turbulence_model,
@@ -16,6 +17,17 @@ from ..knowledge import (
     RefinementRegion, AddLayersControls,
 )
 from ..templates import CaseTemplate, get_template
+from .parallel import _factorize_processors
+
+
+def _coerce_float_scalar(value: Any, parameter_name: str) -> float:
+    """Coerce numeric scalar while rejecting bool/string injections."""
+    if isinstance(value, bool):
+        raise ValueError(f"{parameter_name} 必须是数字，不能是布尔值")
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{parameter_name} 必须是数字，当前值: {value}") from exc
 
 
 @dataclass
@@ -80,6 +92,11 @@ FoamFile
                 self.config.geometry_params.get("height", 0.1)
             )
         )
+        try:
+            char_length = float(char_length)
+        except (TypeError, ValueError):
+            char_length = 0.1
+        char_length = max(char_length, 1e-6)
 
         Re = self.config.reynolds_number
 
@@ -210,13 +227,22 @@ FoamFile
         """Write all case files to disk. Returns list of created files."""
         files = self.generate_all()
         created_files = []
+        case_root = self.config.case_path.resolve()
 
         for rel_path, content in files.items():
-            full_path = self.config.case_path / rel_path
+            rel = Path(rel_path)
+            if rel.is_absolute() or ".." in rel.parts:
+                raise ValueError(f"生成文件路径非法（越界）: {rel_path}")
+
+            full_path = (case_root / rel).resolve()
+            try:
+                full_path.relative_to(case_root)
+            except ValueError as exc:
+                raise ValueError(f"生成文件路径越界: {rel_path}") from exc
+
             full_path.parent.mkdir(parents=True, exist_ok=True)
 
-            with open(full_path, 'w') as f:
-                f.write(content)
+            atomic_write_text(full_path, content)
 
             # Make scripts executable
             if rel_path.startswith("All"):
@@ -238,8 +264,14 @@ FoamFile
         content = self._header("volVectorField", "U")
 
         # Get inlet velocity
-        inlet_vel = self.config.geometry_params.get("inlet_velocity", 1.0)
-        lid_vel = self.config.geometry_params.get("lid_velocity", 1.0)
+        inlet_vel = _coerce_float_scalar(
+            self.config.geometry_params.get("inlet_velocity", 1.0),
+            "inlet_velocity",
+        )
+        lid_vel = _coerce_float_scalar(
+            self.config.geometry_params.get("lid_velocity", 1.0),
+            "lid_velocity",
+        )
 
         content += f'''
 dimensions      [0 1 -1 0 0 0 0];
@@ -1959,15 +1991,7 @@ method          {method};
 '''
 
         if method == "simple":
-            # Calculate simple decomposition
-            # Try to make a roughly cubic decomposition
-            n_x = int(n_processors ** (1/3))
-            n_y = int((n_processors / n_x) ** 0.5)
-            n_z = int(n_processors / (n_x * n_y))
-
-            # Adjust if product doesn't match
-            while n_x * n_y * n_z < n_processors:
-                n_z += 1
+            n_x, n_y, n_z = _factorize_processors(n_processors)
 
             content += f'''
 simpleCoeffs
@@ -1977,13 +2001,7 @@ simpleCoeffs
 }}
 '''
         elif method == "hierarchical":
-            # Hierarchical decomposition
-            n_x = int(n_processors ** (1/3))
-            n_y = int((n_processors / n_x) ** 0.5)
-            n_z = int(n_processors / (n_x * n_y))
-
-            while n_x * n_y * n_z < n_processors:
-                n_z += 1
+            n_x, n_y, n_z = _factorize_processors(n_processors)
 
             content += f'''
 hierarchicalCoeffs
@@ -1995,10 +2013,13 @@ hierarchicalCoeffs
 '''
         elif method == "scotch":
             # Scotch method (load-balanced)
+            weights = " ".join(["1"] * n_processors)
             content += '''
 scotchCoeffs
 {
-    processorWeights (1 1 1 1);
+'''
+            content += f"    processorWeights ({weights});\n"
+            content += '''
 }
 '''
 

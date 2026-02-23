@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
 
 import pytest
@@ -53,3 +54,14 @@ def test_load_server_config_reads_env(monkeypatch, tmp_path) -> None:
     assert cfg.transport == "streamable-http"
     assert cfg.public_host == "127.0.0.1"
     assert cfg.artifact_dir == (tmp_path / "artifacts").resolve()
+
+
+def test_load_server_config_uses_secure_default_artifact_dir(monkeypatch) -> None:
+    monkeypatch.delenv("OPENFOAM_MCP_ARTIFACT_DIR", raising=False)
+    cfg = load_server_config()
+    app_root = Path("/app")
+    # Match runtime logic: prefer /app only when writable.
+    if app_root.exists() and os.access(app_root, os.W_OK):
+        assert cfg.artifact_dir == Path("/app/artifacts").resolve()
+    else:
+        assert cfg.artifact_dir == Path("/tmp/openfoam-mcp-artifacts").resolve()

@@ -6,6 +6,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 # Ensure repo root is importable when running this test file directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -16,6 +18,7 @@ from src.tools.stability_tools import (
 from src.tools.workflow_tools import (
     GenerateModelingPlanInput,
     RunWorkflowFromPromptInput,
+    _to_meters,
     openfoam_generate_modeling_plan,
     openfoam_run_workflow_from_prompt,
 )
@@ -56,6 +59,11 @@ def test_generate_modeling_plan_builds_ready_pipe_flow_plan() -> None:
     assert abs(params["length"] - 0.5) < 1e-9
     assert abs(params["inlet_velocity"] - 1.0) < 1e-9
     assert params["fluid"] == "water"
+
+
+def test_to_meters_rejects_unknown_unit() -> None:
+    with pytest.raises(ValueError, match="不支持的长度单位"):
+        _to_meters(1.0, "inch")
 
 
 def test_generate_modeling_plan_identifies_shock_tube_prompt() -> None:
@@ -262,3 +270,31 @@ def test_run_workflow_from_prompt_consumes_structured_preflight_json(
     assert payload["preflight"]["profile"] == "solver"
     assert "preflight_errors" in payload["warnings"]
     assert "preflight_warnings" in payload["warnings"]
+
+
+def test_workflow_json_response_is_truncated_when_payload_is_too_large(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    case_path = tmp_path / "workflow_large_payload_case"
+    huge_report = "preflight-report:" + ("x" * 80000)
+
+    monkeypatch.setattr(
+        "src.tools.workflow_tools.openfoam_preflight_check",
+        lambda _params: huge_report,
+    )
+
+    result = openfoam_run_workflow_from_prompt(
+        RunWorkflowFromPromptInput(
+            description="模拟水在直径5cm、长度50cm的管道中以1m/s流动",
+            case_path=str(case_path),
+            run_mesh=False,
+            run_solver=False,
+            auto_apply_stability_fixes=True,
+            response_format="json",
+        )
+    )
+
+    payload = json.loads(result)
+    assert payload["response_truncated"] is True
+    assert len(result) <= 25000

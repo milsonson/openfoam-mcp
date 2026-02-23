@@ -10,7 +10,8 @@ import logging
 import re
 import shutil
 import uuid
-from typing import Any, Dict, List, NotRequired, Optional, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict
+from typing_extensions import NotRequired
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -45,7 +46,11 @@ from .case_tools import (
     openfoam_analyze_problem,
     openfoam_generate_residual_plot,
 )
-from .path_utils import resolve_openfoam_command, validate_allowed_case_path
+from .path_utils import (
+    get_allowed_case_roots,
+    resolve_openfoam_command,
+    validate_allowed_case_path,
+)
 from .stability_tools import (
     ApplyStabilityFixesInput,
     AssessCaseStabilityInput,
@@ -65,6 +70,9 @@ class ResponseFormat(str, Enum):
 
 
 logger = logging.getLogger(__name__)
+WORKFLOW_RESPONSE_CHAR_LIMIT = 25000
+WORKFLOW_LONG_STRING_TRIM = 3000
+WORKFLOW_MAX_LIST_ITEMS = 100
 
 
 class KPISummary(TypedDict):
@@ -106,6 +114,7 @@ class WorkflowManifest(TypedDict, total=False):
     contract_version: str
     job_id: str
     portal_url: str
+    delivery_url: str
     status: str
     stage: str
     progress: int
@@ -142,10 +151,9 @@ class RunWorkflowFromPromptInput(BaseModel):
         max_length=4000,
         description="自然语言建模需求描述",
     )
-    case_path: str = Field(
-        ...,
-        min_length=1,
-        description="案例输出目录绝对路径",
+    case_path: Optional[str] = Field(
+        default=None,
+        description="可选案例输出目录绝对路径。不填时服务端自动分配目录。",
     )
     run_mesh: bool = Field(
         default=True,
@@ -190,7 +198,9 @@ class RunWorkflowFromPromptInput(BaseModel):
 
     @field_validator("case_path")
     @classmethod
-    def validate_case_path(cls, value: str) -> str:
+    def validate_case_path(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or not value.strip():
+            return None
         return validate_allowed_case_path(value)
 
 
@@ -200,7 +210,9 @@ def _to_meters(raw_value: float, raw_unit: str) -> float:
         return raw_value * 0.001
     if unit in {"cm", "厘米"}:
         return raw_value * 0.01
-    return raw_value
+    if unit in {"m", "米"}:
+        return raw_value
+    raise ValueError(f"不支持的长度单位: {raw_unit}")
 
 
 def _extract_first_float(desc_lower: str, patterns: List[str]) -> Optional[float]:
@@ -224,7 +236,10 @@ def _extract_named_length(desc_lower: str, keyword: str) -> Optional[float]:
     except ValueError:
         return None
     unit = (match.group(2) or "m").strip()
-    return _to_meters(value, unit)
+    try:
+        return _to_meters(value, unit)
+    except ValueError:
+        return None
 
 
 def _extract_temperature(desc_lower: str, keyword: str) -> Optional[float]:
@@ -318,6 +333,112 @@ def _safe_json_loads(text: str) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+def _truncate_text_response(text: str, limit: int = WORKFLOW_RESPONSE_CHAR_LIMIT) -> str:
+    """Truncate markdown/plain responses to fit MCP output limits."""
+    if len(text) <= limit:
+        return text
+    cutoff = text.rfind("\n", 0, limit - 100)
+    if cutoff == -1:
+        cutoff = limit - 100
+    return (
+        text[:cutoff]
+        + f"\n\n...(输出已截断，共 {len(text)} 字符，显示前 {cutoff} 字符)"
+    )
+
+
+def _trim_long_strings(value: Any, max_chars: int = WORKFLOW_LONG_STRING_TRIM) -> Any:
+    """Recursively trim oversized strings in JSON payloads."""
+    if isinstance(value, str):
+        if len(value) <= max_chars:
+            return value
+        return (
+            value[:max_chars]
+            + f"...(字段已截断，原始长度 {len(value)} 字符)"
+        )
+    if isinstance(value, list):
+        return [_trim_long_strings(item, max_chars=max_chars) for item in value]
+    if isinstance(value, dict):
+        return {k: _trim_long_strings(v, max_chars=max_chars) for k, v in value.items()}
+    return value
+
+
+def _drop_nested_key(payload: Dict[str, Any], path: tuple[str, ...]) -> None:
+    """Remove nested key path if present."""
+    node: Any = payload
+    for part in path[:-1]:
+        if not isinstance(node, dict):
+            return
+        node = node.get(part)
+    if isinstance(node, dict):
+        node.pop(path[-1], None)
+
+
+def _limit_list_size(payload: Dict[str, Any], key: str, max_items: int = WORKFLOW_MAX_LIST_ITEMS) -> None:
+    """Trim list field size and annotate truncated item count."""
+    value = payload.get(key)
+    if not isinstance(value, list) or len(value) <= max_items:
+        return
+    payload[key] = value[:max_items]
+    payload[f"{key}_truncated_count"] = len(value) - max_items
+
+
+def _serialize_json_response(payload: Dict[str, Any], limit: int = WORKFLOW_RESPONSE_CHAR_LIMIT) -> str:
+    """Serialize JSON response while keeping payload within size limits."""
+    encoded = json.dumps(payload, ensure_ascii=False, indent=2)
+    if len(encoded) <= limit:
+        return encoded
+
+    candidate = _trim_long_strings(payload)
+    if not isinstance(candidate, dict):
+        candidate = dict(payload)
+    candidate["response_truncated"] = True
+    candidate["response_truncation_reason"] = "payload_exceeds_character_limit"
+
+    encoded = json.dumps(candidate, ensure_ascii=False, indent=2)
+    if len(encoded) <= limit:
+        return encoded
+
+    for path in [
+        ("preflight", "report"),
+        ("preflight", "details"),
+        ("validation", "report"),
+        ("validation", "errors"),
+        ("validation", "warnings"),
+        ("stability", "before", "report"),
+        ("stability", "after", "report"),
+        ("stability", "fix", "report"),
+        ("plan", "raw_analysis"),
+    ]:
+        _drop_nested_key(candidate, path)
+
+    _limit_list_size(candidate, "artifacts")
+    _limit_list_size(candidate, "warnings")
+    _limit_list_size(candidate, "failures")
+
+    encoded = json.dumps(candidate, ensure_ascii=False, indent=2)
+    if len(encoded) <= limit:
+        return encoded
+
+    minimal = {
+        "contract_version": candidate.get("contract_version"),
+        "job_id": candidate.get("job_id"),
+        "status": candidate.get("status"),
+        "stage": candidate.get("stage"),
+        "template_id": candidate.get("template_id"),
+        "template_name": candidate.get("template_name"),
+        "solver": candidate.get("solver"),
+        "portal_url": candidate.get("portal_url"),
+        "delivery_url": candidate.get("delivery_url"),
+        "manifest_url": candidate.get("manifest_url"),
+        "warnings": candidate.get("warnings", []),
+        "failures": candidate.get("failures", []),
+        "response_truncated": True,
+        "response_truncation_reason": "payload_reduced_to_minimal_view",
+        "message": "响应过大，已返回精简结果。请通过 portal_url 或 manifest_url 查看完整数据。",
+    }
+    return json.dumps(minimal, ensure_ascii=False, indent=2)
+
+
 def _extract_plot_path_from_output(text: str) -> Optional[Path]:
     """Extract residual plot file path from markdown tool output."""
     if not text:
@@ -384,6 +505,20 @@ def _write_json(path: Path, payload: Dict[str, Any] | KPISummary | QualityReport
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _resolve_workflow_case_path(case_path: Optional[str], job_id: str) -> str:
+    """Return validated case path, auto-allocating one when user does not provide it."""
+    if case_path is not None and case_path.strip():
+        return validate_allowed_case_path(case_path)
+
+    allowed_roots = get_allowed_case_roots()
+    preferred_root = next(
+        (root for root in allowed_roots if root.as_posix().startswith("/tmp")),
+        allowed_roots[0],
+    )
+    auto_case_path = preferred_root / "openfoam-mcp" / "cases" / job_id
+    return validate_allowed_case_path(str(auto_case_path))
 
 
 def _build_and_collect_artifacts(
@@ -625,9 +760,9 @@ def openfoam_generate_modeling_plan(params: GenerateModelingPlanInput) -> str:
     plan = _build_modeling_plan(params.description)
 
     if params.response_format == ResponseFormat.JSON:
-        return json.dumps(plan, ensure_ascii=False, indent=2)
+        return _serialize_json_response(plan)
 
-    return _format_plan_markdown(plan)
+    return _truncate_text_response(_format_plan_markdown(plan))
 
 
 def _run_result_to_dict(result: RunResult) -> Dict[str, Any]:
@@ -697,16 +832,18 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
     runtime_config = load_server_config()
     job_id = uuid.uuid4().hex
     portal_url = f"{runtime_config.portal_base_url}/{job_id}"
+    resolved_case_path = _resolve_workflow_case_path(params.case_path, job_id)
     create_job_artifact_dir(job_id)
 
     manifest_state: WorkflowManifest = {
         "contract_version": "v1",
         "job_id": job_id,
         "portal_url": portal_url,
+        "delivery_url": portal_url,
         "status": "running",
         "stage": "planning",
         "progress": 0,
-        "case_path": params.case_path,
+        "case_path": resolved_case_path,
         "created_at": _utc_now_iso(),
     }
     write_job_manifest(job_id, manifest_state)
@@ -763,6 +900,7 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
         payload["contract_version"] = "v1"
         payload["job_id"] = job_id
         payload["portal_url"] = portal_url
+        payload["delivery_url"] = portal_url
         payload["manifest_url"] = build_artifact_url(f"{job_id}/manifest.json")
         return payload
 
@@ -787,8 +925,8 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
         manifest_state.update(base_payload)
         write_job_manifest(job_id, manifest_state)
         if params.response_format == ResponseFormat.JSON:
-            return json.dumps(base_payload, ensure_ascii=False, indent=2)
-        return f"错误: {plan.get('message', '规划失败')}"
+            return _serialize_json_response(base_payload)
+        return _truncate_text_response(f"错误: {plan.get('message', '规划失败')}")
 
     if plan.get("status") != "ready":
         _emit_event(
@@ -809,8 +947,8 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
         manifest_state.update(base_payload)
         write_job_manifest(job_id, manifest_state)
         if params.response_format == ResponseFormat.JSON:
-            return json.dumps(base_payload, ensure_ascii=False, indent=2)
-        return _format_plan_markdown(plan)
+            return _serialize_json_response(base_payload)
+        return _truncate_text_response(_format_plan_markdown(plan))
 
     _emit_event(
         stage="planning",
@@ -820,7 +958,7 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
         data={"template_id": plan.get("template_id")},
     )
 
-    case_path = Path(params.case_path)
+    case_path = Path(resolved_case_path)
     case_existed = case_path.exists()
     _emit_event(stage="create_case", status="running", message="开始生成案例文件", progress=20)
     case_path.mkdir(parents=True, exist_ok=True)
@@ -832,7 +970,7 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
         case_config = create_case_config_from_template(
             template_id=template_id,
             parameters=plan_parameters,
-            case_path=params.case_path,
+            case_path=resolved_case_path,
         )
         generator = OpenFOAMGenerator(case_config)
         created_files = generator.write_case()
@@ -849,7 +987,7 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
             {
                 "status": "failed",
                 "stage": "create_case",
-                "case_path": params.case_path,
+                "case_path": resolved_case_path,
                 "template_id": template_id,
                 "error": str(exc),
                 "plan": plan,
@@ -859,8 +997,8 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
         manifest_state.update(base_payload)
         write_job_manifest(job_id, manifest_state)
         if params.response_format == ResponseFormat.JSON:
-            return json.dumps(base_payload, ensure_ascii=False, indent=2)
-        return f"创建案例失败: {exc}"
+            return _serialize_json_response(base_payload)
+        return _truncate_text_response(f"创建案例失败: {exc}")
 
     _emit_event(
         stage="create_case",
@@ -886,7 +1024,7 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
     )
     preflight_report = openfoam_preflight_check(
         PreflightCheckInput(
-            case_path=params.case_path,
+            case_path=resolved_case_path,
             solver=case_config.solver,
             n_processors=params.n_processors if params.run_parallel else None,
             profile=preflight_profile,
@@ -908,7 +1046,7 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
 
     _emit_event(stage="validation", status="running", message="执行案例验证", progress=45)
     validation = validate_case(
-        case_path=params.case_path,
+        case_path=resolved_case_path,
         run_openfoam=params.run_openfoam_validation,
     )
     _emit_event(stage="validation", status="running", message="案例验证完成", progress=50)
@@ -916,7 +1054,7 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
     _emit_event(stage="stability", status="running", message="评估数值稳定性", progress=55)
     stability_before_raw = openfoam_assess_case_stability(
         AssessCaseStabilityInput(
-            case_path=params.case_path,
+            case_path=resolved_case_path,
             response_format=StabilityResponseFormat.JSON,
         )
     )
@@ -927,7 +1065,7 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
     if params.auto_apply_stability_fixes:
         fix_raw = openfoam_apply_stability_fixes(
             ApplyStabilityFixesInput(
-                case_path=params.case_path,
+                case_path=resolved_case_path,
                 strategy="balanced",
                 response_format=StabilityResponseFormat.JSON,
             )
@@ -936,7 +1074,7 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
 
         stability_after_raw = openfoam_assess_case_stability(
             AssessCaseStabilityInput(
-                case_path=params.case_path,
+                case_path=resolved_case_path,
                 response_format=StabilityResponseFormat.JSON,
             )
         )
@@ -949,13 +1087,19 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
         block_mesh_cmd = resolve_openfoam_command("blockMesh")
         check_mesh_cmd = resolve_openfoam_command("checkMesh")
         if block_mesh_cmd:
-            block_mesh_result = run_mesh_generation(params.case_path, timeout=min(params.timeout, 900.0))
+            block_mesh_result = run_mesh_generation(
+                resolved_case_path,
+                timeout=min(params.timeout, 900.0),
+            )
             mesh_result = {
                 "status": block_mesh_result.status.value,
                 "blockMesh": _run_result_to_dict(block_mesh_result),
             }
             if block_mesh_result.status == RunStatus.COMPLETED and check_mesh_cmd:
-                check_mesh_result = run_mesh_check(params.case_path, timeout=min(params.timeout, 600.0))
+                check_mesh_result = run_mesh_check(
+                    resolved_case_path,
+                    timeout=min(params.timeout, 600.0),
+                )
                 mesh_result["checkMesh"] = _run_result_to_dict(check_mesh_result)
         else:
             mesh_result = {
@@ -981,7 +1125,7 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
         if params.run_parallel:
             if mpirun_cmd and solver_cmd and decompose_cmd:
                 decompose_result = decompose_case(
-                    case_path=params.case_path,
+                    case_path=resolved_case_path,
                     n_processors=params.n_processors,
                     method="scotch",
                     timeout=min(params.timeout, 900.0),
@@ -991,7 +1135,7 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
 
                 if decompose_result.status == RunStatus.COMPLETED:
                     parallel_result = run_parallel(
-                        case_path=params.case_path,
+                        case_path=resolved_case_path,
                         solver=solver_cmd,
                         n_processors=params.n_processors,
                         timeout=params.timeout,
@@ -1001,7 +1145,7 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
 
                     if parallel_result.status == RunStatus.COMPLETED and reconstruct_cmd:
                         reconstruct_result = reconstruct_case(
-                            case_path=params.case_path,
+                            case_path=resolved_case_path,
                             latest_time=False,
                             timeout=min(params.timeout, 900.0),
                         )
@@ -1016,7 +1160,7 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
         else:
             if solver_cmd:
                 result = run_solver(
-                    case_path=params.case_path,
+                    case_path=resolved_case_path,
                     solver=solver_cmd,
                     timeout=params.timeout,
                 )
@@ -1032,7 +1176,7 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
             and solver_result.get("status") == RunStatus.COMPLETED.value
         ):
             solver_result["residual_plot"] = openfoam_generate_residual_plot(
-                GenerateResidualPlotInput(case_path=params.case_path)
+                GenerateResidualPlotInput(case_path=resolved_case_path)
             )
         _emit_event(
             stage="solver",
@@ -1071,7 +1215,7 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
     payload: Dict[str, Any] = {
         "status": status,
         "stage": "completed",
-        "case_path": params.case_path,
+        "case_path": resolved_case_path,
         "template_id": template_id,
         "template_name": plan.get("template_name"),
         "classification_status": plan.get("classification_status"),
@@ -1113,7 +1257,7 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
     )
     artifacts = _build_and_collect_artifacts(
         job_id=job_id,
-        case_path=params.case_path,
+        case_path=resolved_case_path,
         payload=payload,
         kpi_summary=kpi_summary,
         quality_report=quality_report,
@@ -1138,17 +1282,16 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
     write_job_manifest(job_id, manifest_state)
 
     if params.response_format == ResponseFormat.JSON:
-        return json.dumps(payload, ensure_ascii=False, indent=2)
+        return _serialize_json_response(payload)
 
     lines = [
         "# 自然语言工作流执行结果",
         "",
         f"- 状态: `{payload['status']}`",
-        f"- 案例目录: `{payload['case_path']}`",
         f"- 模板: `{payload['template_id']}` ({payload['template_name']})",
         f"- 求解器: `{payload['solver']}`",
         f"- Job ID: `{payload['job_id']}`",
-        f"- Portal: {payload['portal_url']}",
+        f"- 访问链接: {payload['delivery_url']}",
         f"- 生成文件数: {payload['created_files']}",
         f"- 交付产物数: {len(payload['artifacts'])}",
         "",
@@ -1176,4 +1319,4 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
     lines.append("## 求解")
     lines.append(f"- 状态: {payload['solver_run'].get('status', 'unknown')}")
 
-    return "\n".join(lines)
+    return _truncate_text_response("\n".join(lines))

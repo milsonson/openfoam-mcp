@@ -80,8 +80,13 @@ def load_server_config() -> OpenFOAMServerConfig:
     streamable_http_path = os.getenv("OPENFOAM_MCP_STREAMABLE_HTTP_PATH", "/mcp")
     public_host = os.getenv("OPENFOAM_MCP_PUBLIC_HOST", normalize_public_host(host))
 
+    artifact_default_dir = "/app/artifacts"
+    app_root = Path("/app")
+    if not app_root.exists() or not os.access(app_root, os.W_OK):
+        artifact_default_dir = "/tmp/openfoam-mcp-artifacts"
+
     artifact_dir = Path(
-        os.getenv("OPENFOAM_MCP_ARTIFACT_DIR", "/tmp/openfoam-mcp-artifacts")
+        os.getenv("OPENFOAM_MCP_ARTIFACT_DIR", artifact_default_dir)
     ).resolve()
     artifact_default_url, portal_default_url = build_default_base_urls(public_host, port)
     artifact_base_url = os.getenv("OPENFOAM_MCP_ARTIFACT_BASE_URL", artifact_default_url)

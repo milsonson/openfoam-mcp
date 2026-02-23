@@ -74,6 +74,14 @@ class CaseTemplate:
 
             if param.name in values:
                 value = values[param.name]
+                if param.type in {"float", "int"}:
+                    if type(value) not in (int, float):
+                        errors.append(f"{param.label} 类型错误: 期望数字，实际 {type(value).__name__}")
+                        continue
+                elif param.type == "string":
+                    if not isinstance(value, str):
+                        errors.append(f"{param.label} 类型错误: 期望字符串，实际 {type(value).__name__}")
+                        continue
                 if param.range:
                     if value < param.range[0] or value > param.range[1]:
                         errors.append(

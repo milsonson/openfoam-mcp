@@ -69,6 +69,8 @@ class SolverRunner:
         self._stdout_lines: List[str] = []
         self._stderr_lines: List[str] = []
         self._start_time: Optional[datetime] = None
+        self._state_lock = threading.RLock()
+        self._process_lock = threading.RLock()
 
     def _resolve_command(self, command: str) -> Optional[str]:
         """Resolve command path from explicit path, PATH, or FOAM_APPBIN."""
@@ -94,18 +96,19 @@ class SolverRunner:
 
     def _cleanup_process(self) -> None:
         """Close process pipes and clear process handle."""
-        proc = self.process
-        if not proc:
-            return
+        with self._process_lock:
+            proc = self.process
+            if not proc:
+                return
 
-        for pipe in (proc.stdout, proc.stderr):
-            if pipe:
-                try:
-                    pipe.close()
-                except Exception:
-                    pass
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe:
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
 
-        self.process = None
+            self.process = None
 
     def run_command(
         self,
@@ -150,31 +153,40 @@ class SolverRunner:
             timeout,
         )
         self._start_time = datetime.now()
-        self.progress = RunProgress(status=RunStatus.RUNNING)
-        self._stdout_lines = []
-        self._stderr_lines = []
+        with self._state_lock:
+            self.progress = RunProgress(status=RunStatus.RUNNING)
+            self._stdout_lines = []
+            self._stderr_lines = []
 
         try:
-            self.process = subprocess.Popen(
-                full_command,
-                cwd=self.case_path,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                # Use default (block) buffering for communicate() safety
-            )
+            with self._process_lock:
+                self.process = subprocess.Popen(
+                    full_command,
+                    cwd=self.case_path,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    # Use default (block) buffering for communicate() safety
+                )
 
             # Use communicate() exclusively — do NOT mix with a reader thread
             # on the same pipe, as that causes a race condition / deadlock.
             try:
-                stdout, stderr = self.process.communicate(timeout=timeout)
+                proc = self.process
+                if proc is None:
+                    raise RuntimeError("进程启动失败")
+                stdout, stderr = proc.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
-                self.process.kill()
-                stdout, stderr = self.process.communicate()
-                self._stdout_lines = stdout.split('\n')
-                self._stderr_lines = stderr.split('\n')
+                proc = self.process
+                if proc is None:
+                    raise RuntimeError("进程状态异常")
+                proc.kill()
+                stdout, stderr = proc.communicate()
+                with self._state_lock:
+                    self._stdout_lines = stdout.split('\n')
+                    self._stderr_lines = stderr.split('\n')
                 # Parse progress from collected output
-                for line in self._stdout_lines:
+                for line in stdout.split('\n'):
                     self._parse_progress_line(line)
 
                 logger.warning(
@@ -194,8 +206,9 @@ class SolverRunner:
                     error_message="执行超时"
                 )
 
-            self._stdout_lines = stdout.split('\n')
-            self._stderr_lines = stderr.split('\n')
+            with self._state_lock:
+                self._stdout_lines = stdout.split('\n')
+                self._stderr_lines = stderr.split('\n')
 
             # Parse progress from the collected output
             for line in self._stdout_lines:
@@ -207,7 +220,9 @@ class SolverRunner:
             # Determine result
             duration = self._get_elapsed_seconds()
 
-            if self.process.returncode == 0:
+            proc = self.process
+            return_code = proc.returncode if proc else -1
+            if return_code == 0:
                 converged = self._check_convergence(stdout)
                 logger.info(
                     "命令执行完成 command=%s case_path=%s return_code=0 converged=%s duration=%.3f",
@@ -231,12 +246,12 @@ class SolverRunner:
                     "命令执行失败 command=%s case_path=%s return_code=%s error=%s",
                     command,
                     self.case_path,
-                    self.process.returncode,
+                    return_code,
                     error_msg,
                 )
                 return RunResult(
                     status=RunStatus.FAILED,
-                    return_code=self.process.returncode,
+                    return_code=return_code,
                     stdout=stdout,
                     stderr=stderr,
                     duration_seconds=duration,
@@ -255,11 +270,14 @@ class SolverRunner:
                 error_message=f"命令 '{command}' 未找到。请确保 OpenFOAM 环境已正确设置。"
             )
         except Exception as e:
+            with self._state_lock:
+                stdout_text = '\n'.join(self._stdout_lines)
+                stderr_text = '\n'.join(self._stderr_lines)
             return RunResult(
                 status=RunStatus.FAILED,
                 return_code=-1,
-                stdout='\n'.join(self._stdout_lines),
-                stderr='\n'.join(self._stderr_lines) + f"\n{str(e)}",
+                stdout=stdout_text,
+                stderr=stderr_text + f"\n{str(e)}",
                 duration_seconds=self._get_elapsed_seconds(),
                 final_residuals={},
                 error_message=str(e)
@@ -290,18 +308,20 @@ class SolverRunner:
 
         full_command = [resolved_command] + args
         self._start_time = datetime.now()
-        self.progress = RunProgress(status=RunStatus.RUNNING)
-        self._stdout_lines = []
-        self._stderr_lines = []
+        with self._state_lock:
+            self.progress = RunProgress(status=RunStatus.RUNNING)
+            self._stdout_lines = []
+            self._stderr_lines = []
 
-        self.process = subprocess.Popen(
-            full_command,
-            cwd=self.case_path,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
+        with self._process_lock:
+            self.process = subprocess.Popen(
+                full_command,
+                cwd=self.case_path,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
 
         # Start monitoring thread
         self._stop_monitoring.clear()
@@ -319,14 +339,18 @@ class SolverRunner:
         Returns:
             True if cancelled, False if no process was running
         """
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
+        with self._process_lock:
+            proc = self.process
 
-            self.progress.status = RunStatus.CANCELLED
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+            with self._state_lock:
+                self.progress.status = RunStatus.CANCELLED
             self._stop_monitoring.set()
             if self._monitor_thread and self._monitor_thread.is_alive():
                 self._monitor_thread.join(timeout=2)
@@ -336,22 +360,28 @@ class SolverRunner:
 
     def get_status(self) -> RunProgress:
         """Get current run status and progress."""
-        if self.process:
-            poll = self.process.poll()
-            if poll is None:
-                self.progress.status = RunStatus.RUNNING
-            elif poll == 0:
-                self.progress.status = RunStatus.COMPLETED
-            else:
-                self.progress.status = RunStatus.FAILED
+        with self._process_lock:
+            proc = self.process
 
-            self.progress.elapsed_seconds = self._get_elapsed_seconds()
+        if proc:
+            poll = proc.poll()
+            with self._state_lock:
+                if poll is None:
+                    self.progress.status = RunStatus.RUNNING
+                elif poll == 0:
+                    self.progress.status = RunStatus.COMPLETED
+                else:
+                    self.progress.status = RunStatus.FAILED
 
-        return self.progress
+                self.progress.elapsed_seconds = self._get_elapsed_seconds()
+
+        with self._state_lock:
+            return self.progress
 
     def get_log_tail(self, lines: int = DEFAULT_LOG_TAIL_LINES) -> str:
         """Get the last N lines of output."""
-        all_lines = self._stdout_lines + self._stderr_lines
+        with self._state_lock:
+            all_lines = list(self._stdout_lines) + list(self._stderr_lines)
         return '\n'.join(all_lines[-lines:])
 
     def _monitor_output(self, on_progress: Optional[Callable[[RunProgress], None]]):
@@ -369,13 +399,15 @@ class SolverRunner:
                     if self.process.stdout:
                         line = self.process.stdout.readline()
                         if line:
-                            self._stdout_lines.append(line.rstrip())
+                            with self._state_lock:
+                                self._stdout_lines.append(line.rstrip())
                             self._parse_progress_line(line)
 
                             if on_progress:
                                 on_progress(self.progress)
                 except Exception as exc:
-                    self._stderr_lines.append(f"[monitor_error] {exc}")
+                    with self._state_lock:
+                        self._stderr_lines.append(f"[monitor_error] {exc}")
                     self._stop_monitoring.set()
                     break
 
@@ -387,36 +419,38 @@ class SolverRunner:
                         line = self.process.stdout.readline()
                         if not line:
                             break
-                        self._stdout_lines.append(line.rstrip())
+                        with self._state_lock:
+                            self._stdout_lines.append(line.rstrip())
                         self._parse_progress_line(line)
                 except Exception:
-                    pass
+                    logger.exception("monitor 输出收尾阶段异常")
 
     def _parse_progress_line(self, line: str):
         """Parse a log line for progress information."""
-        # Parse time step
-        time_match = re.search(r'Time\s*=\s*([\d.e+-]+)', line)
-        if time_match:
-            self.progress.current_time = float(time_match.group(1))
+        with self._state_lock:
+            # Parse time step
+            time_match = re.search(r'Time\s*=\s*([\d.e+-]+)', line)
+            if time_match:
+                self.progress.current_time = float(time_match.group(1))
 
-        # Parse iteration
-        iter_match = re.search(r'Iteration\s*(\d+)', line, re.IGNORECASE)
-        if iter_match:
-            self.progress.iteration = int(iter_match.group(1))
+            # Parse iteration
+            iter_match = re.search(r'Iteration\s*(\d+)', line, re.IGNORECASE)
+            if iter_match:
+                self.progress.iteration = int(iter_match.group(1))
 
-        # Parse residuals
-        # Format: "Solving for U, Initial residual = X, Final residual = Y"
-        residual_match = re.search(
-            r'Solving for (\w+),.*?Final residual\s*=\s*([\d.e+-]+)',
-            line
-        )
-        if residual_match:
-            field = residual_match.group(1)
-            residual = float(residual_match.group(2))
-            self.progress.residuals[field] = residual
+            # Parse residuals
+            # Format: "Solving for U, Initial residual = X, Final residual = Y"
+            residual_match = re.search(
+                r'Solving for (\w+),.*?Final residual\s*=\s*([\d.e+-]+)',
+                line
+            )
+            if residual_match:
+                field = residual_match.group(1)
+                residual = float(residual_match.group(2))
+                self.progress.residuals[field] = residual
 
-        self.progress.last_update = datetime.now()
-        self.progress.elapsed_seconds = self._get_elapsed_seconds()
+            self.progress.last_update = datetime.now()
+            self.progress.elapsed_seconds = self._get_elapsed_seconds()
 
     def _get_elapsed_seconds(self) -> float:
         """Get elapsed time since start."""
@@ -429,9 +463,11 @@ class SolverRunner:
         # Look for convergence indicators
         if "solution converged" in output.lower():
             return True
-        if "End" in output and "FOAM FATAL" not in output:
+        if re.search(r"^\s*End\s*$", output, flags=re.MULTILINE) and "FOAM FATAL" not in output:
             # Check final residuals
-            for field, residual in self.progress.residuals.items():
+            with self._state_lock:
+                residuals = dict(self.progress.residuals)
+            for field, residual in residuals.items():
                 if residual > CONVERGENCE_RESIDUAL_THRESHOLD:
                     return False
             return True

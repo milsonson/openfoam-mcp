@@ -200,7 +200,7 @@ def render_portal_html(manifest: dict[str, Any]) -> str:
     }}
 
     function renderSummary() {{
-      summaryGrid.innerHTML = "";
+      summaryGrid.replaceChildren();
       const kpi = payload.kpi_summary || {{}};
       const quality = payload.quality_report || {{}};
       const summaryEntries = [
@@ -214,29 +214,74 @@ def render_portal_html(manifest: dict[str, Any]) -> str:
       for (const [label, value] of summaryEntries) {{
         const card = document.createElement("article");
         card.className = "card";
-        card.innerHTML = `<h3>${{label}}</h3><div class="value">${{String(value)}}</div>`;
+        const title = document.createElement("h3");
+        title.textContent = label;
+        const body = document.createElement("div");
+        body.className = "value";
+        body.textContent = String(value);
+        card.appendChild(title);
+        card.appendChild(body);
         summaryGrid.appendChild(card);
       }}
     }}
 
+    function safeDownloadUrl(url) {{
+      if (!url) return null;
+      try {{
+        const parsed = new URL(String(url), window.location.origin);
+        if (parsed.protocol === "http:" || parsed.protocol === "https:") {{
+          return parsed.href;
+        }}
+      }} catch (_err) {{
+        // Ignore invalid URLs.
+      }}
+      return null;
+    }}
+
     function renderArtifacts() {{
-      artifactBody.innerHTML = "";
+      artifactBody.replaceChildren();
       const artifacts = Array.isArray(payload.artifacts) ? payload.artifacts : [];
       if (artifacts.length === 0) {{
         const row = document.createElement("tr");
-        row.innerHTML = "<td colspan='4' class='muted'>No artifacts generated</td>";
+        const cell = document.createElement("td");
+        cell.colSpan = 4;
+        cell.className = "muted";
+        cell.textContent = "No artifacts generated";
+        row.appendChild(cell);
         artifactBody.appendChild(row);
         return;
       }}
       for (const item of artifacts) {{
         const row = document.createElement("tr");
         const size = item.size_bytes ? `${{item.size_bytes}} B` : "N/A";
-        row.innerHTML = `
-          <td>${{item.name || "unknown"}}</td>
-          <td>${{item.type || "file"}}</td>
-          <td>${{size}}</td>
-          <td>${{item.url ? `<a class="download" href="${{item.url}}" download>Download</a>` : "N/A"}}</td>
-        `;
+
+        const nameCell = document.createElement("td");
+        nameCell.textContent = String(item.name || "unknown");
+        row.appendChild(nameCell);
+
+        const typeCell = document.createElement("td");
+        typeCell.textContent = String(item.type || "file");
+        row.appendChild(typeCell);
+
+        const sizeCell = document.createElement("td");
+        sizeCell.textContent = size;
+        row.appendChild(sizeCell);
+
+        const actionCell = document.createElement("td");
+        const safeUrl = safeDownloadUrl(item.url);
+        if (safeUrl) {{
+          const link = document.createElement("a");
+          link.className = "download";
+          link.href = safeUrl;
+          link.setAttribute("download", "");
+          link.rel = "noopener noreferrer";
+          link.textContent = "Download";
+          actionCell.appendChild(link);
+        }} else {{
+          actionCell.textContent = "N/A";
+        }}
+        row.appendChild(actionCell);
+
         artifactBody.appendChild(row);
       }}
     }}
@@ -260,12 +305,26 @@ def render_portal_html(manifest: dict[str, Any]) -> str:
       timelineSeen.add(key);
 
       const li = document.createElement("li");
-      li.innerHTML = `
-        <span class="stage">${{stage}}</span>
-        <span class="small">${{status}}</span>
-        <div>${{message || ""}}</div>
-        <div class="small">${{ts || ""}}</div>
-      `;
+      const stageSpan = document.createElement("span");
+      stageSpan.className = "stage";
+      stageSpan.textContent = stage;
+
+      const statusSpan = document.createElement("span");
+      statusSpan.className = "small";
+      statusSpan.textContent = status;
+
+      const messageDiv = document.createElement("div");
+      messageDiv.textContent = message || "";
+
+      const timeDiv = document.createElement("div");
+      timeDiv.className = "small";
+      timeDiv.textContent = ts || "";
+
+      li.appendChild(stageSpan);
+      li.appendChild(document.createTextNode(" "));
+      li.appendChild(statusSpan);
+      li.appendChild(messageDiv);
+      li.appendChild(timeDiv);
       timeline.prepend(li);
     }}
 

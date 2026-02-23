@@ -225,6 +225,8 @@ python src/server.py
 ### `openfoam_run_workflow_from_prompt`
 
 - 会按意图自动选择 preflight profile（`mesh`/`solver`/`parallel`/`diagnostic`）
+- `case_path` 现为可选：未提供时自动分配到允许根目录下（默认 `/tmp/openfoam-mcp/cases/<job_id>`）
+- 返回 `portal_url`（同 `delivery_url`）作为面向最终用户的访问入口，页面内提供下载按钮
 - 汇总 `warnings` 与 `failures`
 - 状态更细化：
   - `completed`
@@ -234,6 +236,7 @@ python src/server.py
 ## 10. 输入与安全约束
 
 - 多数 `case_path` 要求绝对路径（`/` 开头）
+- `openfoam_run_workflow_from_prompt` 可不传 `case_path`，由服务端自动生成安全目录
 - 教程文件读取限制在 `FOAM_TUTORIALS` 目录内
 - 字典读写限制在目标案例目录内，防止路径逃逸
 
@@ -292,6 +295,9 @@ openfoam_preflight_check(profile="solver" 或 "parallel")
 请查看返回中的 `warnings` 列表定位具体原因。
 
 ## 14. Docker 与 Google Cloud Run 部署
+
+当前 `Dockerfile` 已内置 OpenFOAM 11 运行时，容器启动时会自动加载
+`/opt/openfoam11/etc/bashrc`。因此在 Cloud Run/远端服务器上无需额外安装 OpenFOAM。
 
 ### 14.1 本地构建并运行
 

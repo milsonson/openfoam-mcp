@@ -8,6 +8,53 @@ import re
 from ..io_utils import atomic_write_text
 from .runner import RunResult, RunStatus, SolverRunner
 
+_SAFE_SOLVER_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*$")
+_UNSAFE_SHELL_FRAGMENT_RE = re.compile(r"[;&|`<>]")
+
+
+def _validate_parallel_solver(solver: str) -> str:
+    """Validate solver executable token/path passed to mpirun."""
+    value = solver.strip()
+    if not value:
+        raise ValueError("solver 不能为空")
+    if any(ch.isspace() for ch in value) or "\x00" in value:
+        raise ValueError("solver 包含非法空白字符")
+    if _UNSAFE_SHELL_FRAGMENT_RE.search(value) or "$(" in value or "${" in value:
+        raise ValueError("solver 包含非法 shell 元字符")
+    if value.startswith("-"):
+        raise ValueError("solver 不能以 '-' 开头")
+
+    if "/" in value:
+        candidate = Path(value)
+        if not candidate.is_file():
+            raise ValueError(f"solver 可执行文件不存在: {value}")
+        return str(candidate)
+
+    if not _SAFE_SOLVER_NAME_RE.fullmatch(value):
+        raise ValueError(f"非法 solver 名称: {solver}")
+    return value
+
+
+def _resolve_hostfile(case_path: str, hostfile: str) -> str:
+    """Resolve and validate hostfile path under case directory."""
+    case_root = Path(case_path).resolve()
+    candidate = Path(hostfile).expanduser()
+    candidate_abs = candidate if candidate.is_absolute() else (case_root / candidate)
+
+    if candidate_abs.exists() and candidate_abs.is_symlink():
+        raise ValueError("hostfile 不能是符号链接")
+
+    resolved = candidate_abs.resolve()
+
+    try:
+        resolved.relative_to(case_root)
+    except ValueError as exc:
+        raise ValueError("hostfile 必须位于案例目录内") from exc
+
+    if not resolved.exists() or not resolved.is_file():
+        raise ValueError(f"hostfile 不存在或不是文件: {resolved}")
+    return str(resolved)
+
 
 def _upsert_entry(content: str, key: str, value: str) -> str:
     """Insert or update a top-level dictionary entry."""
@@ -192,13 +239,16 @@ def run_parallel(
     Returns:
         RunResult with execution details
     """
+    safe_solver = _validate_parallel_solver(solver)
+
     # Build mpirun command
     args = ["-np", str(n_processors)]
 
     if hostfile:
-        args.extend(["-hostfile", hostfile])
+        safe_hostfile = _resolve_hostfile(case_path, hostfile)
+        args.extend(["-hostfile", safe_hostfile])
 
-    args.append(solver)
+    args.append(safe_solver)
     args.append("-parallel")
 
     # Use mpirun to run the solver
