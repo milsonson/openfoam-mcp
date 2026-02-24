@@ -124,6 +124,7 @@ _STEADY_SOLVERS = {
 
 _SAFE_SOLVER_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*$")
 _FLOAT_COMPARE_EPS = 1e-9
+_LAMINAR_ONLY_SOLVERS = {"icofoam"}
 
 
 def _validate_solver_name(solver: str) -> str:
@@ -176,6 +177,69 @@ def _extract_block(content: str, block_name: str) -> Optional[str]:
 def _extract_application(control_dict: str) -> Optional[str]:
     """Extract solver name from controlDict application entry."""
     return _extract_word_value(control_dict, "application")
+
+
+def _has_function_object_type(control_dict: str, object_type: str) -> bool:
+    """Check whether controlDict functions block contains a given functionObject type."""
+    functions_block = _extract_block(control_dict, "functions")
+    if not functions_block:
+        return False
+    pattern = rf"\btype\s+{re.escape(object_type)}\s*;"
+    return bool(re.search(pattern, functions_block))
+
+
+def _collect_solver_compatibility_checks(
+    solver: Optional[str],
+    control_text: Optional[str],
+    case_path: Optional[Path],
+) -> List[Dict[str, str]]:
+    """Collect compatibility findings between solver and runtime dictionaries."""
+    checks: List[Dict[str, str]] = []
+    if not solver:
+        return checks
+
+    solver_name = solver.strip()
+    solver_lower = solver_name.lower()
+    if solver_lower not in _LAMINAR_ONLY_SOLVERS:
+        return checks
+    if not control_text:
+        return checks
+
+    if _has_function_object_type(control_text, "yPlus"):
+        checks.append(
+            {
+                "severity": "error",
+                "title": f"{solver_name} 与 yPlus 兼容性",
+                "message": (
+                    f"检测到 yPlus functionObject，但 {solver_name} 通常不提供湍流模型数据库，"
+                    "运行时可能触发 fatal error。"
+                ),
+                "suggestion": "移除 yPlus functionObject，或切换到支持湍流的求解器（如 pimpleFoam）。",
+            }
+        )
+
+    if case_path is not None:
+        turbulence_path = case_path / "constant" / "turbulenceProperties"
+        if turbulence_path.exists():
+            try:
+                turbulence_text = turbulence_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                turbulence_text = ""
+            simulation_type = (_extract_word_value(turbulence_text, "simulationType") or "").strip()
+            if simulation_type and simulation_type.lower() != "laminar":
+                checks.append(
+                    {
+                        "severity": "error",
+                        "title": f"{solver_name} 与 turbulenceProperties 兼容性",
+                        "message": (
+                            f"constant/turbulenceProperties 设置 simulationType={simulation_type}，"
+                            f"与 {solver_name} 预期的层流设置不兼容。"
+                        ),
+                        "suggestion": "将 simulationType 设置为 laminar，或改用支持湍流模型的求解器。",
+                    }
+                )
+
+    return checks
 
 
 def _add_check(
@@ -296,15 +360,18 @@ def openfoam_preflight_check(params: PreflightCheckInput) -> str:
             )
 
     solver = params.solver
+    control_text: Optional[str] = None
     case_path_obj: Optional[Path] = None
     if params.case_path:
         case_path_obj = Path(params.case_path)
         control_dict = case_path_obj / "system" / "controlDict"
-        if not solver and control_dict.exists():
+        if control_dict.exists():
             try:
-                solver = _extract_application(control_dict.read_text(encoding="utf-8", errors="replace"))
+                control_text = control_dict.read_text(encoding="utf-8", errors="replace")
             except Exception:
-                solver = None
+                control_text = None
+        if not solver and control_text:
+            solver = _extract_application(control_text)
 
     commands = ["blockMesh", "checkMesh", "decomposePar", "reconstructPar", "mpirun"]
     if solver:
@@ -369,6 +436,7 @@ def openfoam_preflight_check(params: PreflightCheckInput) -> str:
                         "message": "文件存在" if p.is_file() else "缺少文件",
                     }
                 )
+    compatibility_checks = _collect_solver_compatibility_checks(solver, control_text, case_path_obj)
 
     # Aggregate counts
     for item in env_checks:
@@ -402,6 +470,14 @@ def openfoam_preflight_check(params: PreflightCheckInput) -> str:
     for item in case_checks:
         severity = "ok" if item["status"] == "ok" else "error"
         _add_check(checks, severity, f"案例项 {item['name']}", item["message"])
+    for item in compatibility_checks:
+        _add_check(
+            checks,
+            item["severity"],
+            item["title"],
+            item["message"],
+            suggestion=item.get("suggestion"),
+        )
 
     errors = sum(1 for c in checks if c["severity"] == "error")
     warnings = sum(1 for c in checks if c["severity"] == "warning")
@@ -426,6 +502,7 @@ def openfoam_preflight_check(params: PreflightCheckInput) -> str:
         "env_checks": env_checks,
         "command_checks": command_checks,
         "case_checks": case_checks,
+        "compatibility_checks": compatibility_checks,
         "checks": checks,
     }
 
@@ -465,6 +542,15 @@ def openfoam_preflight_check(params: PreflightCheckInput) -> str:
     else:
         lines.append("- ℹ️ 未提供 case_path，已跳过案例结构检查")
 
+    if compatibility_checks:
+        lines.append("")
+        lines.append("## 兼容性检查")
+        for item in compatibility_checks:
+            icon = "✅" if item["severity"] == "ok" else ("❌" if item["severity"] == "error" else "⚠️")
+            lines.append(f"- {icon} **{item['title']}**: {item['message']}")
+            if item.get("suggestion"):
+                lines.append(f"  建议: {item['suggestion']}")
+
     if errors:
         lines.append("")
         lines.append("## 建议")
@@ -499,6 +585,15 @@ def openfoam_assess_case_stability(params: AssessCaseStabilityInput) -> str:
     solver_lower = solver.lower()
 
     checks: List[Dict[str, str]] = []
+    compatibility_checks = _collect_solver_compatibility_checks(solver, control_text, case_path)
+    for item in compatibility_checks:
+        _add_check(
+            checks,
+            item["severity"],
+            item["title"],
+            item["message"],
+            suggestion=item.get("suggestion"),
+        )
 
     delta_t = _extract_scalar_value(control_text, "deltaT")
     if delta_t is None:

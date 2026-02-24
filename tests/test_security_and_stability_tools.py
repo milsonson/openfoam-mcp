@@ -168,6 +168,46 @@ def test_get_patch_list_parses_all_blockmesh_patches(tmp_path: Path):
     assert "- outlet" in result
 
 
+def test_get_patch_list_ignores_foamfile_header_in_polymesh(tmp_path: Path):
+    """polyMesh/boundary parser should ignore FoamFile header blocks."""
+    case_path = tmp_path / "case_poly_boundary"
+    poly_mesh_dir = case_path / "constant" / "polyMesh"
+    poly_mesh_dir.mkdir(parents=True, exist_ok=True)
+    (poly_mesh_dir / "boundary").write_text(
+        (
+            "FoamFile\n"
+            "{\n"
+            "    version 2.0;\n"
+            "    format ascii;\n"
+            "    class polyBoundaryMesh;\n"
+            "    object boundary;\n"
+            "}\n"
+            "3\n"
+            "(\n"
+            "movingWall\n"
+            "{\n"
+            "    type wall;\n"
+            "}\n"
+            "fixedWalls\n"
+            "{\n"
+            "    type wall;\n"
+            "}\n"
+            "frontAndBack\n"
+            "{\n"
+            "    type empty;\n"
+            "}\n"
+            ")\n"
+        ),
+        encoding="utf-8",
+    )
+
+    result = openfoam_get_patch_list(GetPatchListInput(case_path=str(case_path)))
+    assert "- movingWall" in result
+    assert "- fixedWalls" in result
+    assert "- frontAndBack" in result
+    assert "- FoamFile" not in result
+
+
 def test_update_dictionary_uses_atomic_write(tmp_path: Path, monkeypatch):
     """Dictionary updates should go through atomic write helper."""
     case_path = tmp_path / "case_update_dict"
@@ -194,6 +234,46 @@ def test_update_dictionary_uses_atomic_write(tmp_path: Path, monkeypatch):
     assert "成功更新" in result
     assert called.get("path") == dict_path
     assert "endTime 20;" in called.get("content", "")
+
+
+def test_update_dictionary_updates_top_level_only(tmp_path: Path):
+    """Top-level updates should not rewrite same key inside nested blocks."""
+    case_path = tmp_path / "case_update_scope"
+    (case_path / "system").mkdir(parents=True, exist_ok=True)
+    dict_path = case_path / "system" / "controlDict"
+    dict_path.write_text(
+        (
+            "application simpleFoam;\n"
+            "writeInterval 100;\n"
+            "functions\n"
+            "{\n"
+            "    residuals\n"
+            "    {\n"
+            "        type residuals;\n"
+            "        writeInterval 1;\n"
+            "    }\n"
+            "    forces\n"
+            "    {\n"
+            "        type forces;\n"
+            "        writeInterval 10;\n"
+            "    }\n"
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    result = openfoam_update_dictionary(
+        UpdateDictionaryInput(
+            case_path=str(case_path),
+            dict_path="system/controlDict",
+            updates={"writeInterval": 7},
+        )
+    )
+    assert "成功更新" in result
+    content = dict_path.read_text(encoding="utf-8")
+    assert "writeInterval 7;" in content
+    assert "writeInterval 1;" in content
+    assert "writeInterval 10;" in content
 
 
 def test_update_dictionary_rejects_multiline_value(tmp_path: Path):
@@ -978,4 +1058,83 @@ def test_assess_case_stability_flags_high_risk_settings(tmp_path: Path):
     )
     assert "adjustTimeStep" in result
     assert "maxCo" in result
+
+
+def test_preflight_check_flags_icofoam_yplus_incompatibility(tmp_path: Path):
+    """Preflight should detect yPlus function object incompatibility with icoFoam."""
+    case_path = tmp_path / "case_preflight_icofoam"
+    _create_min_case(case_path)
+
+    (case_path / "system" / "controlDict").write_text(
+        (
+            "application icoFoam;\n"
+            "deltaT 0.001;\n"
+            "functions\n"
+            "{\n"
+            "    yPlus1\n"
+            "    {\n"
+            "        type yPlus;\n"
+            "    }\n"
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+    (case_path / "constant" / "turbulenceProperties").write_text(
+        (
+            "FoamFile{}\n"
+            "simulationType RAS;\n"
+        ),
+        encoding="utf-8",
+    )
+
+    result = openfoam_preflight_check(
+        PreflightCheckInput(case_path=str(case_path), profile="solver")
+    )
+    assert "yPlus" in result
+    assert "icoFoam" in result
+
+
+def test_assess_case_stability_flags_icofoam_yplus_incompatibility(tmp_path: Path):
+    """Stability assessment should flag yPlus/turbulence mismatch for icoFoam."""
+    case_path = tmp_path / "case_stability_icofoam"
+    _create_min_case(case_path)
+
+    (case_path / "system" / "controlDict").write_text(
+        (
+            "application icoFoam;\n"
+            "deltaT 0.001;\n"
+            "functions\n"
+            "{\n"
+            "    yPlus1\n"
+            "    {\n"
+            "        type yPlus;\n"
+            "    }\n"
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+    (case_path / "system" / "fvSolution").write_text(
+        (
+            "FoamFile{}\n"
+            "PISO\n"
+            "{\n"
+            "    nCorrectors 2;\n"
+            "    nNonOrthogonalCorrectors 0;\n"
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+    (case_path / "constant" / "turbulenceProperties").write_text(
+        (
+            "FoamFile{}\n"
+            "simulationType RAS;\n"
+        ),
+        encoding="utf-8",
+    )
+
+    result = openfoam_assess_case_stability(
+        AssessCaseStabilityInput(case_path=str(case_path))
+    )
+    assert "yPlus" in result
+    assert "icoFoam" in result
     assert "maxAlphaCo" in result

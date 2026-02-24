@@ -24,4 +24,4 @@
 ## 报告清单
 
 - `2026-02-23-openfoam-remote-call-test.md`：`openfoam-remote` MCP 全量接口调用测试
-
+- `2026-02-24-openfoam-remote-call-test-v2.md`：同日第二轮联调对比报告（含优化优先级）

@@ -9,7 +9,7 @@ import re
 from ..io_utils import atomic_write_text
 from ..knowledge import (
     FlowType, TimeType, TurbulenceType,
-    select_solver, estimate_reynolds_number, recommend_turbulence_model,
+    select_solver, estimate_reynolds_number, recommend_turbulence_model, get_solver_info,
     get_fluid_properties,
     BoundaryType, BoundaryDefinition, get_boundary_conditions,
     BlockMeshParams, create_pipe_mesh_params, create_cavity_mesh_params,
@@ -2317,13 +2317,18 @@ def create_case_config_from_template(
 
     re = estimate_reynolds_number(char_velocity, char_length, fluid_props["nu"])
 
-    # Determine turbulence - multiphase usually laminar for VOF accuracy
+    # Determine turbulence model, constrained by template/solver capabilities.
     if flow_type == FlowType.MULTIPHASE:
         turbulence = TurbulenceType.LAMINAR
     elif flow_type == FlowType.COMPRESSIBLE:
         turbulence = TurbulenceType.LAMINAR  # Compressible templates usually laminar for shock capturing
     else:
         turbulence = recommend_turbulence_model(re)
+        solver_info = get_solver_info(template.solver)
+        if not template.supports_turbulence:
+            turbulence = TurbulenceType.LAMINAR
+        elif solver_info is not None and not solver_info.supports_turbulence:
+            turbulence = TurbulenceType.LAMINAR
 
     # Create boundary definitions based on template
     boundaries = _create_boundaries_for_template(template_id, user_parameters)

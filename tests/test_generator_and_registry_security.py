@@ -150,6 +150,32 @@ def test_laminar_control_dict_omits_turbulence_residual_fields(tmp_path: Path) -
     assert "(p U k epsilon omega)" not in control_dict
 
 
+def test_cavity_icofoam_forces_laminar_controls(tmp_path: Path) -> None:
+    """icoFoam template should stay laminar and avoid turbulence-only function objects."""
+    case_path = tmp_path / "cavity_case_laminar"
+    config = create_case_config_from_template(
+        template_id="cavity_flow",
+        parameters={
+            "width": 0.1,
+            "height": 0.1,
+            "lid_velocity": 5.0,
+            "fluid": "water",
+        },
+        case_path=str(case_path),
+    )
+
+    files = OpenFOAMGenerator(config).generate_all()
+    control_dict = files["system/controlDict"]
+    turbulence_properties = files["constant/turbulenceProperties"]
+
+    assert config.solver == "icoFoam"
+    assert config.turbulence_type.value == "laminar"
+    assert "fields          (p U);" in control_dict
+    assert "(p U k epsilon omega)" not in control_dict
+    assert "type            yPlus;" not in control_dict
+    assert "simulationType  laminar;" in turbulence_properties
+
+
 def test_generate_allrun_rejects_unsafe_solver_token(tmp_path: Path) -> None:
     """Allrun generation should reject unsafe solver tokens."""
     case_path = tmp_path / "unsafe_solver_case"

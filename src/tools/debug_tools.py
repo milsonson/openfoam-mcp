@@ -87,6 +87,28 @@ def _extract_parenthesized_section(content: str, section_name: str) -> str | Non
     return None
 
 
+def _extract_parenthesized_from_index(content: str, start: int) -> str | None:
+    """Extract balanced parenthesized content from known '(' index."""
+    if start < 0 or start >= len(content) or content[start] != "(":
+        return None
+
+    depth = 0
+    for idx in range(start, len(content)):
+        ch = content[idx]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return content[start + 1 : idx]
+    return None
+
+
+def _line_code_without_comment(line: str) -> str:
+    """Strip inline // comments for lightweight structural parsing."""
+    return line.split("//", 1)[0]
+
+
 # ============================================================================ 
 # Tool Implementations
 # ============================================================================ 
@@ -109,12 +131,18 @@ def openfoam_get_patch_list(params: GetPatchListInput) -> str:
         try:
             with open(boundary_file, 'r', encoding='utf-8', errors='replace') as f:
                 content = f.read()
-                # Find number of patches
-                num_match = re.search(r'(\d+)\s*\(', content)
-                if num_match:
-                    # Extract patch names (words followed by {)
-                    patch_matches = re.findall(r'^\s*(\w+)\s*\{', content, re.MULTILINE)
-                    patches = patch_matches
+                # polyMesh/boundary starts patch definitions after "<nPatches> (".
+                start_match = re.search(r'^\s*\d+\s*\(', content, re.MULTILINE)
+                if start_match:
+                    start = content.find("(", start_match.start())
+                    inner_content = _extract_parenthesized_from_index(content, start)
+                    if inner_content:
+                        patch_matches = re.findall(
+                            r'^\s*([A-Za-z_]\w*)\s*\{',
+                            inner_content,
+                            re.MULTILINE,
+                        )
+                        patches = patch_matches
         except Exception as e:
             return f"解析 boundary 文件时出错: {str(e)}"
             
@@ -203,26 +231,31 @@ def openfoam_update_dictionary(params: UpdateDictionaryInput) -> str:
         modified = False
         new_lines = []
         updated_keys = []
+        brace_depth = 0
         
         for line in lines:
-            new_line = line
-            if line.lstrip().startswith("//"):
-                new_lines.append(new_line)
-                continue
-            for key, value in params.updates.items():
-                # Match "key value;" or "key (value);"
-                # Regex looks for key at start of line (optional whitespace), 
-                # followed by some whitespace, then any value until a semicolon.
-                pattern = rf'^(\s*{re.escape(key)}\b\s+)([^;]+)(;.*)$'
-                match = re.match(pattern, line)
-                if match:
-                    val_str = _normalize_dictionary_value_for_update(key, value)
-                    
-                    new_line = f"{match.group(1)}{val_str}{match.group(3)}\n"
-                    modified = True
-                    if key not in updated_keys:
-                        updated_keys.append(key)
-            new_lines.append(new_line)
+            had_newline = line.endswith("\n")
+            line_body = line[:-1] if had_newline else line
+            updated_line = line_body
+
+            if brace_depth == 0 and not line_body.lstrip().startswith("//"):
+                for key, value in params.updates.items():
+                    # Top-level only: avoid rewriting nested blocks (e.g. functions.*).
+                    pattern = rf'^(\s*{re.escape(key)}\b\s+)([^;]+)(;.*)$'
+                    match = re.match(pattern, line_body)
+                    if match:
+                        val_str = _normalize_dictionary_value_for_update(key, value)
+                        updated_line = f"{match.group(1)}{val_str}{match.group(3)}"
+                        modified = True
+                        if key not in updated_keys:
+                            updated_keys.append(key)
+
+            new_lines.append(updated_line + ("\n" if had_newline else ""))
+
+            code_part = _line_code_without_comment(line_body)
+            brace_depth += code_part.count("{") - code_part.count("}")
+            if brace_depth < 0:
+                brace_depth = 0
             
         if modified:
             atomic_write_text(file_path, "".join(new_lines))

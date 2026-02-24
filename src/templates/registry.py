@@ -169,6 +169,7 @@ CAVITY_FLOW_TEMPLATE = CaseTemplate(
     solver="icoFoam",
     geometry_type="cavity",
     is_2d=True,
+    supports_turbulence=False,
     parameters=[
         ParameterDefinition(
             name="width",
