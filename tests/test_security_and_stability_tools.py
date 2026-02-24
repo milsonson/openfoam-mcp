@@ -46,6 +46,7 @@ from src.tools.stability_tools import (
     AssessCaseStabilityInput,
     ApplyStabilityFixesInput,
     PreflightCheckInput,
+    _upsert_top_level_entry,
     openfoam_assess_case_stability,
     openfoam_preflight_check,
 )
@@ -638,6 +639,77 @@ def test_decompose_case_switch_to_scotch_adds_scotch_coeffs(tmp_path: Path, monk
     assert "simpleCoeffs" not in updated
 
 
+def test_decompose_case_switch_to_simple_removes_metis_coeffs(tmp_path: Path, monkeypatch):
+    """Switching existing dict to simple should remove metis block leftovers."""
+    case_path = tmp_path / "parallel_case_simple"
+    system_path = case_path / "system"
+    system_path.mkdir(parents=True, exist_ok=True)
+    decompose_dict = system_path / "decomposeParDict"
+    decompose_dict.write_text(
+        (
+            "numberOfSubdomains 4;\n"
+            "method metis;\n\n"
+            "metisCoeffs\n"
+            "{\n"
+            "    processorWeights (1 1 1 1);\n"
+            "}\n\n"
+            "// ************************************************************************* //\n"
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_run_command(self, command, args=None, timeout=None):
+        return RunResult(
+            status=RunStatus.COMPLETED,
+            return_code=0,
+            stdout="ok",
+            stderr="",
+            duration_seconds=0.01,
+            final_residuals={},
+            converged=False,
+        )
+
+    monkeypatch.setattr("src.core.parallel.SolverRunner.run_command", fake_run_command)
+
+    result = decompose_case(str(case_path), n_processors=4, method="simple")
+    assert result.status == RunStatus.COMPLETED
+
+    updated = decompose_dict.read_text(encoding="utf-8")
+    assert "method simple;" in updated
+    assert "simpleCoeffs" in updated
+    assert "metisCoeffs" not in updated
+
+
+def test_core_run_parallel_persists_solver_log(tmp_path: Path, monkeypatch) -> None:
+    """run_parallel should persist log.simpleFoam for downstream status tools."""
+    case_path = tmp_path / "parallel_log_case"
+    _create_min_case(case_path)
+
+    def fake_run_command(self, command, args=None, timeout=None, on_progress=None):
+        return RunResult(
+            status=RunStatus.COMPLETED,
+            return_code=0,
+            stdout="Time = 1\nEnd\n",
+            stderr="",
+            duration_seconds=0.2,
+            final_residuals={"U": 1e-5},
+            converged=True,
+        )
+
+    monkeypatch.setattr("src.core.parallel.SolverRunner.run_command", fake_run_command)
+
+    result = run_parallel(
+        case_path=str(case_path),
+        solver="simpleFoam",
+        n_processors=2,
+    )
+
+    assert result.status == RunStatus.COMPLETED
+    log_file = case_path / "log.simpleFoam"
+    assert log_file.exists()
+    assert "Time = 1" in log_file.read_text(encoding="utf-8")
+
+
 def test_core_run_parallel_rejects_invalid_solver_argument(tmp_path: Path) -> None:
     """run_parallel should block malformed solver arguments before mpirun execution."""
     case_path = tmp_path / "parallel_solver_guard"
@@ -864,6 +936,16 @@ def test_validator_detects_misordered_braces():
     validator = CaseValidator("/tmp")
     errors = validator._check_dict_syntax("}\n{\nFoamFile\n{\n}\n")
     assert any("顺序错误" in err for err in errors)
+
+
+def test_upsert_top_level_entry_respects_word_boundary() -> None:
+    """Updating deltaT should not clobber maxDeltaT-like keys."""
+    original = "maxDeltaT 1;\nadjustDeltaT no;\n"
+    updated = _upsert_top_level_entry(original, "deltaT", "0.001")
+
+    assert "maxDeltaT 1;" in updated
+    assert "adjustDeltaT no;" in updated
+    assert "\ndeltaT 0.001;\n" in updated or updated.startswith("deltaT 0.001;\n")
 
 
 def test_assess_case_stability_flags_high_risk_settings(tmp_path: Path):

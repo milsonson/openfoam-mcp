@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_LOG_TAIL_LINES = 50
 ERROR_MESSAGE_MAX_CHARS = 500
 CONVERGENCE_RESIDUAL_THRESHOLD = 1e-3
+_LOG_FILE_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 class RunStatus(str, Enum):
@@ -172,12 +173,14 @@ class SolverRunner:
             # Use communicate() exclusively — do NOT mix with a reader thread
             # on the same pipe, as that causes a race condition / deadlock.
             try:
-                proc = self.process
+                with self._process_lock:
+                    proc = self.process
                 if proc is None:
                     raise RuntimeError("进程启动失败")
                 stdout, stderr = proc.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
-                proc = self.process
+                with self._process_lock:
+                    proc = self.process
                 if proc is None:
                     raise RuntimeError("进程状态异常")
                 proc.kill()
@@ -220,7 +223,8 @@ class SolverRunner:
             # Determine result
             duration = self._get_elapsed_seconds()
 
-            proc = self.process
+            with self._process_lock:
+                proc = self.process
             return_code = proc.returncode if proc else -1
             if return_code == 0:
                 converged = self._check_convergence(stdout)
@@ -354,7 +358,10 @@ class SolverRunner:
             self._stop_monitoring.set()
             if self._monitor_thread and self._monitor_thread.is_alive():
                 self._monitor_thread.join(timeout=2)
-            self._cleanup_process()
+            # For synchronous run_command(), avoid closing pipes while
+            # communicate() may still be active in another thread.
+            if self._monitor_thread is not None:
+                self._cleanup_process()
             return True
         return False
 
@@ -386,18 +393,22 @@ class SolverRunner:
 
     def _monitor_output(self, on_progress: Optional[Callable[[RunProgress], None]]):
         """Monitor process output in a separate thread."""
-        if not self.process:
+        with self._process_lock:
+            proc = self.process
+        if not proc:
             return
 
         try:
             while not self._stop_monitoring.is_set():
-                if self.process.poll() is not None:
+                with self._process_lock:
+                    proc = self.process
+                if not proc or proc.poll() is not None:
                     break
 
                 try:
                     # Read stdout
-                    if self.process.stdout:
-                        line = self.process.stdout.readline()
+                    if proc.stdout:
+                        line = proc.stdout.readline()
                         if line:
                             with self._state_lock:
                                 self._stdout_lines.append(line.rstrip())
@@ -413,10 +424,12 @@ class SolverRunner:
 
                 time.sleep(0.1)
         finally:
-            if self.process and self.process.stdout:
+            with self._process_lock:
+                proc = self.process
+            if proc and proc.stdout:
                 try:
                     while True:
-                        line = self.process.stdout.readline()
+                        line = proc.stdout.readline()
                         if not line:
                             break
                         with self._state_lock:
@@ -424,6 +437,23 @@ class SolverRunner:
                         self._parse_progress_line(line)
                 except Exception:
                     logger.exception("monitor 输出收尾阶段异常")
+            with self._process_lock:
+                live_proc = self.process
+            final_status: Optional[RunStatus] = None
+            if live_proc is None:
+                final_status = RunStatus.CANCELLED
+            else:
+                poll = live_proc.poll()
+                if poll is None:
+                    final_status = RunStatus.RUNNING
+                elif poll == 0:
+                    final_status = RunStatus.COMPLETED
+                else:
+                    final_status = RunStatus.FAILED
+
+            with self._state_lock:
+                if self.progress.status == RunStatus.RUNNING and final_status is not None:
+                    self.progress.status = final_status
 
     def _parse_progress_line(self, line: str):
         """Parse a log line for progress information."""
@@ -467,6 +497,8 @@ class SolverRunner:
             # Check final residuals
             with self._state_lock:
                 residuals = dict(self.progress.residuals)
+            if not residuals:
+                return False
             for field, residual in residuals.items():
                 if residual > CONVERGENCE_RESIDUAL_THRESHOLD:
                     return False
@@ -492,6 +524,43 @@ class SolverRunner:
         return "未知错误"
 
 
+def _normalize_solver_log_name(solver: str) -> str:
+    """Normalize solver token/path into a safe log filename."""
+    token = Path(solver).name.strip()
+    if not token:
+        token = "solver"
+    token = _LOG_FILE_SAFE_NAME_RE.sub("_", token)
+    return f"log.{token}"
+
+
+def persist_solver_log(case_path: str, solver: str, result: RunResult) -> None:
+    """Persist solver stdout/stderr as case log file for status/plot tools."""
+    case_dir = Path(case_path)
+    if not case_dir.exists() or not case_dir.is_dir():
+        return
+
+    log_path = case_dir / _normalize_solver_log_name(solver)
+    chunks: list[str] = []
+    if result.stdout:
+        chunks.append(result.stdout.rstrip("\n"))
+    if result.stderr:
+        if chunks:
+            chunks.append("")
+        chunks.append("[stderr]")
+        chunks.append(result.stderr.rstrip("\n"))
+    if not chunks:
+        chunks.append(f"# status: {result.status.value}")
+
+    payload = "\n".join(chunks)
+    if not payload.endswith("\n"):
+        payload += "\n"
+
+    try:
+        log_path.write_text(payload, encoding="utf-8")
+    except Exception:
+        logger.exception("写入求解器日志失败 case_path=%s solver=%s", case_path, solver)
+
+
 def run_solver(
     case_path: str,
     solver: str,
@@ -511,7 +580,9 @@ def run_solver(
         RunResult with execution details
     """
     runner = SolverRunner(case_path)
-    return runner.run_command(solver, timeout=timeout, on_progress=on_progress)
+    result = runner.run_command(solver, timeout=timeout, on_progress=on_progress)
+    persist_solver_log(case_path, solver, result)
+    return result
 
 
 def run_mesh_generation(case_path: str, timeout: float = 300) -> RunResult:

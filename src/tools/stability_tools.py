@@ -198,7 +198,7 @@ def _add_check(
 
 def _upsert_top_level_entry(content: str, key: str, value: str) -> str:
     """Insert or update a top-level OpenFOAM dictionary entry."""
-    pattern = rf"(^\s*{re.escape(key)}\s+)([^;]+)(;)"
+    pattern = rf"(^\s*{re.escape(key)}\b\s+)([^;]+)(;)"
     if re.search(pattern, content, re.MULTILINE):
         return re.sub(pattern, rf"\g<1>{value}\g<3>", content, count=1, flags=re.MULTILINE)
 
@@ -256,7 +256,7 @@ def _upsert_block_entry(
 
     block_start, block_end = span
     body = content[block_start + 1 : block_end]
-    pattern = rf"(^\s*{re.escape(key)}\s+)([^;]+)(;)"
+    pattern = rf"(^\s*{re.escape(key)}\b\s+)([^;]+)(;)"
     if re.search(pattern, body, re.MULTILINE):
         new_body = re.sub(pattern, rf"\g<1>{value}\g<3>", body, count=1, flags=re.MULTILINE)
     else:

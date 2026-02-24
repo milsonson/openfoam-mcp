@@ -61,6 +61,20 @@ def test_generate_modeling_plan_builds_ready_pipe_flow_plan() -> None:
     assert params["fluid"] == "water"
 
 
+def test_generate_modeling_plan_identifies_leaking_pipe_prompt() -> None:
+    result = openfoam_generate_modeling_plan(
+        GenerateModelingPlanInput(
+            description="给我建模一个漏水的水管，直径5cm，长度1m，入口速度1m/s",
+            response_format="json",
+        )
+    )
+
+    data = json.loads(result)
+    assert data["status"] == "ready"
+    assert data["template_id"] == "pipe_flow"
+    assert data["classification_status"] == "ok"
+
+
 def test_to_meters_rejects_unknown_unit() -> None:
     with pytest.raises(ValueError, match="不支持的长度单位"):
         _to_meters(1.0, "inch")
@@ -221,6 +235,29 @@ def test_run_workflow_from_prompt_blocks_case_creation_on_ambiguous_prompt(tmp_p
     assert payload["plan"]["classification_status"] == "low_confidence"
     assert payload["plan"]["confidence"] < 0.6
     assert not case_path.exists()
+
+
+def test_run_workflow_from_prompt_returns_structured_error_when_case_path_is_file(
+    tmp_path: Path,
+) -> None:
+    case_path = tmp_path / "nl_case_target"
+    case_path.write_text("not a directory", encoding="utf-8")
+
+    result = openfoam_run_workflow_from_prompt(
+        RunWorkflowFromPromptInput(
+            description="模拟水在直径5cm、长度50cm的管道中以1m/s流动",
+            case_path=str(case_path),
+            run_mesh=False,
+            run_solver=False,
+            auto_apply_stability_fixes=True,
+            response_format="json",
+        )
+    )
+
+    payload = json.loads(result)
+    assert payload["status"] == "failed"
+    assert payload["stage"] == "create_case"
+    assert "不是目录" in payload["error"]
 
 
 def test_run_workflow_from_prompt_consumes_structured_preflight_json(

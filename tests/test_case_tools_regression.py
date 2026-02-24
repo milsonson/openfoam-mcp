@@ -11,7 +11,12 @@ import pytest
 # Ensure repo root is importable when running this test file directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.tools.case_tools import CreateCaseInput, openfoam_create_case
+from src.tools.case_tools import (
+    AnalyzeProblemInput,
+    CreateCaseInput,
+    openfoam_analyze_problem,
+    openfoam_create_case,
+)
 
 
 def _pipe_flow_params() -> dict[str, object]:
@@ -107,3 +112,14 @@ def test_openfoam_create_case_rolls_back_new_case_on_generation_failure(
 
     assert "创建案例时发生错误" in result
     assert not case_path.exists()
+
+
+def test_analyze_problem_does_not_misclassify_soil_as_oil() -> None:
+    """English word boundaries should avoid matching soil -> oil."""
+    result = openfoam_analyze_problem(
+        AnalyzeProblemInput(
+            description="Analyze airflow over soil surface with 2 m/s inlet velocity",
+            response_format="json",
+        )
+    )
+    assert '"fluid": "oil"' not in result

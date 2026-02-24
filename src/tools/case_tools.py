@@ -66,6 +66,12 @@ def _truncate(text: str, limit: int = CHARACTER_LIMIT) -> str:
     return text[:cutoff] + f"\n\n...(输出已截断，共 {len(text)} 字符，显示前 {cutoff} 字符)"
 
 
+def _contains_missing_metis_error(*messages: Optional[str]) -> bool:
+    """Detect decomposePar failures caused by missing metis decomposition library."""
+    haystack = "\n".join(msg for msg in messages if msg).lower()
+    return "metis" in haystack and "libmetisdecomp.so" in haystack
+
+
 def _validate_allowed_case_path(case_path: str) -> str:
     """Compatibility wrapper for shared case path validator."""
     return validate_allowed_case_path(case_path)
@@ -141,6 +147,7 @@ def _normalize_boundary_value(raw_value: Any, class_type: str) -> str:
             return f"({raw_value[0]} {raw_value[1]} {raw_value[2]})"
 
         value_text = str(raw_value).strip()
+        value_text = re.sub(r"^uniform\s+", "", value_text, flags=re.IGNORECASE)
         vector_match = re.fullmatch(
             r"\(?\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\s+"
             r"([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\s+"
@@ -158,6 +165,7 @@ def _normalize_boundary_value(raw_value: Any, class_type: str) -> str:
         return str(raw_value)
 
     value_text = str(raw_value).strip()
+    value_text = re.sub(r"^uniform\s+", "", value_text, flags=re.IGNORECASE)
     if value_text.startswith("(") and value_text.endswith(")"):
         raise ValueError(f"标量场边界值不能是向量形式: {raw_value}")
     if not _SAFE_BC_EXTRA_VALUE_RE.fullmatch(value_text):
@@ -170,7 +178,10 @@ def _normalize_boundary_value(raw_value: Any, class_type: str) -> str:
 _TEMPLATE_CLASSIFICATION_RULES: Dict[str, list[tuple[str, float]]] = {
     "pipe_flow": [
         (r"管道", 2.2),
+        (r"水管|管线|管路", 2.2),
         (r"\bpipe\b", 2.2),
+        (r"\bpipeline\b|\btube\b|\bhose\b", 2.2),
+        (r"漏水|泄漏|渗漏|leak(?:ing)?", 1.1),
         (r"内流", 1.2),
     ],
     "cavity_flow": [
@@ -783,6 +794,7 @@ def openfoam_create_case(params: CreateCaseInput) -> str:
     case_target = Path(params.case_path)
     case_existed = case_target.exists()
 
+    case_files_generated = False
     try:
         # Create case configuration
         config = create_case_config_from_template(
@@ -794,6 +806,7 @@ def openfoam_create_case(params: CreateCaseInput) -> str:
         # Generate files
         generator = OpenFOAMGenerator(config)
         created_files = generator.write_case()
+        case_files_generated = True
 
         result_lines = [
             "# 案例创建成功",
@@ -903,11 +916,11 @@ def openfoam_create_case(params: CreateCaseInput) -> str:
         return _truncate("\n".join(result_lines))
 
     except ValueError as e:
-        if not case_existed and case_target.exists():
+        if not case_existed and case_target.exists() and not case_files_generated:
             shutil.rmtree(case_target, ignore_errors=True)
         return _truncate(f"错误: {str(e)}\n\n请使用 `openfoam_get_template_info` 查看模板的参数要求。")
     except Exception as e:
-        if not case_existed and case_target.exists():
+        if not case_existed and case_target.exists() and not case_files_generated:
             shutil.rmtree(case_target, ignore_errors=True)
         return _truncate(f"创建案例时发生错误: {str(e)}")
 
@@ -1074,9 +1087,9 @@ def openfoam_analyze_problem(params: AnalyzeProblemInput) -> str:
 
     # Detect fluid
     fluid = "water"
-    if "空气" in desc or "air" in desc:
+    if "空气" in desc or re.search(r"\bair\b", desc):
         fluid = "air"
-    elif "油" in desc or "oil" in desc:
+    elif "油" in desc or re.search(r"\boil\b", desc):
         fluid = "oil"
     analysis["flow_params"]["fluid"] = fluid
 
@@ -1698,13 +1711,28 @@ def openfoam_run_parallel(params: RunParallelInput) -> str:
 
         lines.append("## 分解网格")
         decompose_timeout = min(float(params.timeout or 3600), 600.0)
+        decompose_method = "simple"
         decompose_result = decompose_case(
             case_path=str(case_path),
             n_processors=params.n_processors,
-            method="scotch",
+            method=decompose_method,
             timeout=decompose_timeout,
             force=True,
         )
+
+        if decompose_result.status != RunStatus.COMPLETED and _contains_missing_metis_error(
+            decompose_result.error_message,
+            decompose_result.stderr,
+            decompose_result.stdout,
+        ):
+            lines.append("⚠️ 检测到 metis 分解库缺失，已重新生成 simple 分解配置并重试")
+            decompose_result = decompose_case(
+                case_path=str(case_path),
+                n_processors=params.n_processors,
+                method=decompose_method,
+                timeout=decompose_timeout,
+                force=True,
+            )
 
         if decompose_result.status != RunStatus.COMPLETED:
             lines.append("❌ decomposePar 失败")
@@ -1733,6 +1761,7 @@ def openfoam_run_parallel(params: RunParallelInput) -> str:
             return _truncate("\n".join(lines))
 
         lines.append("✅ decomposePar 完成")
+        lines.append(f"**分解方法**: `{decompose_method}`")
         lines.append("")
         lines.append("## 运行求解器")
 

@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import tarfile
+import time
 from typing import Any, TypedDict
 
 from .config import load_server_config
@@ -30,6 +31,8 @@ _DEFAULT_SUPPORTED_SUFFIXES = {
     ".zst",
     ".html",
 }
+_AUTO_CLEANUP_INTERVAL_SECONDS = 300.0
+_last_auto_cleanup_at = 0.0
 
 
 class ArtifactMetadata(TypedDict):
@@ -63,6 +66,8 @@ def ensure_job_id(job_id: str) -> str:
 
 def create_job_artifact_dir(job_id: str) -> Path:
     """Create and return a job-specific artifact directory."""
+    _auto_cleanup_if_needed()
+
     safe_job_id = ensure_job_id(job_id)
     job_dir = (_artifact_root() / safe_job_id).resolve()
     root = _artifact_root().resolve()
@@ -70,6 +75,22 @@ def create_job_artifact_dir(job_id: str) -> Path:
         raise ValueError("job 目录越界，不在 artifact 根目录内")
     job_dir.mkdir(parents=True, exist_ok=True)
     return job_dir
+
+
+def _auto_cleanup_if_needed() -> None:
+    """Periodically enforce TTL/max-jobs cleanup in long-running processes."""
+    global _last_auto_cleanup_at
+
+    now = time.monotonic()
+    if now - _last_auto_cleanup_at < _AUTO_CLEANUP_INTERVAL_SECONDS:
+        return
+
+    cfg = load_server_config()
+    cleanup_old_job_dirs(
+        ttl_seconds=cfg.artifact_ttl_seconds,
+        max_jobs=cfg.artifact_max_jobs,
+    )
+    _last_auto_cleanup_at = now
 
 
 def safe_resolve_artifact_path(relative_path: str) -> Path:

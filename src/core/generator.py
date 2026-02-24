@@ -4,12 +4,13 @@ from typing import Dict, Any, List, Optional
 from pathlib import Path
 from dataclasses import dataclass
 import os
+import re
 
 from ..io_utils import atomic_write_text
 from ..knowledge import (
     FlowType, TimeType, TurbulenceType,
     select_solver, estimate_reynolds_number, recommend_turbulence_model,
-    get_fluid_properties, format_vector, format_scalar,
+    get_fluid_properties,
     BoundaryType, BoundaryDefinition, get_boundary_conditions,
     BlockMeshParams, create_pipe_mesh_params, create_cavity_mesh_params,
     create_external_flow_mesh_params, estimate_cell_count,
@@ -28,6 +29,17 @@ def _coerce_float_scalar(value: Any, parameter_name: str) -> float:
         return float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{parameter_name} 必须是数字，当前值: {value}") from exc
+
+
+_SAFE_SCRIPT_SOLVER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*$")
+
+
+def _sanitize_solver_token_for_script(solver: str) -> str:
+    """Validate solver token before embedding into generated shell scripts."""
+    token = str(solver).strip()
+    if not _SAFE_SCRIPT_SOLVER_RE.fullmatch(token):
+        raise ValueError(f"非法求解器名称，无法写入 Allrun: {solver}")
+    return token
 
 
 @dataclass
@@ -73,7 +85,6 @@ FoamFile
 }}
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 '''
-
     def __init__(self, config: CaseConfig):
         self.config = config
 
@@ -189,9 +200,11 @@ FoamFile
             files["constant/thermophysicalProperties"] = self._generate_thermophysical_properties()
             files["constant/g"] = self._generate_g()
             files["constant/transportProperties"] = self._generate_transport_properties()
+            files["constant/physicalProperties"] = self._generate_physical_properties()
         else:
             files["0/p"] = self._generate_p()
             files["constant/transportProperties"] = self._generate_transport_properties()
+            files["constant/physicalProperties"] = self._generate_physical_properties()
 
         if self.config.turbulence_type != TurbulenceType.LAMINAR:
             files["0/k"] = self._generate_k()
@@ -513,8 +526,14 @@ boundaryField
         """Generate temperature field for heat transfer cases."""
         content = self._header("volScalarField", "T")
 
-        hot_temp = self.config.geometry_params.get("hot_wall_temp", 310)
-        cold_temp = self.config.geometry_params.get("cold_wall_temp", 290)
+        hot_temp = _coerce_float_scalar(
+            self.config.geometry_params.get("hot_wall_temp", 310),
+            "hot_wall_temp",
+        )
+        cold_temp = _coerce_float_scalar(
+            self.config.geometry_params.get("cold_wall_temp", 290),
+            "cold_wall_temp",
+        )
         avg_temp = (hot_temp + cold_temp) / 2
 
         content += f'''
@@ -554,7 +573,10 @@ boundaryField
         content = self._header("volScalarField", "p")
 
         # Get initial pressure from template parameters
-        p_init = self.config.geometry_params.get("initial_pressure", 101325.0)
+        p_init = _coerce_float_scalar(
+            self.config.geometry_params.get("initial_pressure", 101325.0),
+            "initial_pressure",
+        )
 
         content += f'''
 dimensions      [1 -1 -2 0 0 0 0];
@@ -569,12 +591,18 @@ boundaryField
 
             if boundary.physical_type == BoundaryType.INLET:
                 # Total pressure at inlet
-                p_inlet = self.config.geometry_params.get("inlet_pressure", p_init)
+                p_inlet = _coerce_float_scalar(
+                    self.config.geometry_params.get("inlet_pressure", p_init),
+                    "inlet_pressure",
+                )
                 content += f"        type            totalPressure;\n"
                 content += f"        p0              uniform {p_inlet};\n"
                 content += f"        value           uniform {p_inlet};\n"
             elif boundary.physical_type == BoundaryType.OUTLET:
-                p_outlet = self.config.geometry_params.get("outlet_pressure", p_init)
+                p_outlet = _coerce_float_scalar(
+                    self.config.geometry_params.get("outlet_pressure", p_init),
+                    "outlet_pressure",
+                )
                 content += f"        type            fixedValue;\n"
                 content += f"        value           uniform {p_outlet};\n"
             elif boundary.physical_type == BoundaryType.WALL:
@@ -599,7 +627,10 @@ boundaryField
         content = self._header("volScalarField", "T")
 
         # Get initial temperature from template parameters
-        T_init = self.config.geometry_params.get("initial_temperature", 300.0)
+        T_init = _coerce_float_scalar(
+            self.config.geometry_params.get("initial_temperature", 300.0),
+            "initial_temperature",
+        )
 
         content += f'''
 dimensions      [0 0 0 1 0 0 0];
@@ -614,7 +645,10 @@ boundaryField
 
             if boundary.physical_type == BoundaryType.INLET:
                 # Total temperature at inlet
-                T_inlet = self.config.geometry_params.get("inlet_temperature", T_init)
+                T_inlet = _coerce_float_scalar(
+                    self.config.geometry_params.get("inlet_temperature", T_init),
+                    "inlet_temperature",
+                )
                 content += f"        type            totalTemperature;\n"
                 content += f"        T0              uniform {T_inlet};\n"
                 content += f"        value           uniform {T_inlet};\n"
@@ -623,9 +657,10 @@ boundaryField
             elif boundary.physical_type == BoundaryType.WALL:
                 # Adiabatic wall by default
                 wall_temp = self.config.geometry_params.get("wall_temperature", None)
-                if wall_temp:
+                if wall_temp is not None:
+                    wall_temp_value = _coerce_float_scalar(wall_temp, "wall_temperature")
                     content += f"        type            fixedValue;\n"
-                    content += f"        value           uniform {wall_temp};\n"
+                    content += f"        value           uniform {wall_temp_value};\n"
                 else:
                     content += f"        type            zeroGradient;\n"
             elif boundary.physical_type == BoundaryType.SYMMETRY:
@@ -766,7 +801,10 @@ boundaryField
         content = self._header("dictionary", "transportProperties")
 
         # Get surface tension (default water-air at 20°C)
-        sigma = self.config.geometry_params.get("surface_tension", 0.07)
+        sigma = _coerce_float_scalar(
+            self.config.geometry_params.get("surface_tension", 0.07),
+            "surface_tension",
+        )
 
         content += f'''
 phases (water air);
@@ -799,8 +837,14 @@ sigma           [1 0 -2 0 0 0 0] {sigma};
 
         if template_id == "dam_break":
             # Water column dimensions
-            water_width = self.config.geometry_params.get("water_column_width", 0.146)
-            water_height = self.config.geometry_params.get("water_column_height", 0.292)
+            water_width = _coerce_float_scalar(
+                self.config.geometry_params.get("water_column_width", 0.146),
+                "water_column_width",
+            )
+            water_height = _coerce_float_scalar(
+                self.config.geometry_params.get("water_column_height", 0.292),
+                "water_column_height",
+            )
 
             content += f'''
 defaultFieldValues
@@ -824,8 +868,14 @@ regions
 '''
         elif template_id == "bubble_rising":
             # Bubble dimensions
-            bubble_d = self.config.geometry_params.get("bubble_diameter", 0.01)
-            column_width = self.config.geometry_params.get("column_width", 0.06)
+            bubble_d = _coerce_float_scalar(
+                self.config.geometry_params.get("bubble_diameter", 0.01),
+                "bubble_diameter",
+            )
+            column_width = _coerce_float_scalar(
+                self.config.geometry_params.get("column_width", 0.06),
+                "column_width",
+            )
             # Bubble center at bottom center of domain
             cx = column_width / 2.0
             cy = bubble_d * 1.5  # 1.5 diameters from bottom
@@ -854,11 +904,26 @@ regions
 '''
         elif template_id == "shock_tube":
             # Shock tube - initialize left and right states
-            diaphragm_pos = self.config.geometry_params.get("diaphragm_position", 5.0)
-            left_p = self.config.geometry_params.get("left_pressure", 100000.0)
-            right_p = self.config.geometry_params.get("right_pressure", 10000.0)
-            left_T = self.config.geometry_params.get("left_temperature", 348.432)
-            right_T = self.config.geometry_params.get("right_temperature", 278.746)
+            diaphragm_pos = _coerce_float_scalar(
+                self.config.geometry_params.get("diaphragm_position", 5.0),
+                "diaphragm_position",
+            )
+            left_p = _coerce_float_scalar(
+                self.config.geometry_params.get("left_pressure", 100000.0),
+                "left_pressure",
+            )
+            right_p = _coerce_float_scalar(
+                self.config.geometry_params.get("right_pressure", 10000.0),
+                "right_pressure",
+            )
+            left_T = _coerce_float_scalar(
+                self.config.geometry_params.get("left_temperature", 348.432),
+                "left_temperature",
+            )
+            right_T = _coerce_float_scalar(
+                self.config.geometry_params.get("right_temperature", 278.746),
+                "right_temperature",
+            )
 
             content += f'''
 defaultFieldValues
@@ -904,6 +969,21 @@ regions
 
         content += f'''
 transportModel  Newtonian;
+
+nu              [0 2 -1 0 0 0 0] {nu};
+
+// ************************************************************************* //
+'''
+        return content
+
+    def _generate_physical_properties(self) -> str:
+        """Generate physicalProperties for newer OpenFOAM distributions."""
+        content = self._header("dictionary", "physicalProperties")
+
+        nu = self.config.fluid_properties.get("nu", 1e-6)
+
+        content += f'''
+viscosityModel  Newtonian;
 
 nu              [0 2 -1 0 0 0 0] {nu};
 
@@ -1103,22 +1183,26 @@ functions
         if self.config.flow_type == FlowType.MULTIPHASE:
             content += '''    residuals
     {
-        type            solverInfo;
-        libs            (utilityFunctionObjects);
+        type            residuals;
+        libs            ("libutilityFunctionObjects.so");
         writeControl    timeStep;
         writeInterval   1;
         fields          (p_rgh U);
     }
 '''
         else:
+            fields = "(p U k epsilon omega)"
+            if self.config.turbulence_type == TurbulenceType.LAMINAR:
+                fields = "(p U)"
             content += '''    residuals
     {
-        type            solverInfo;
-        libs            (utilityFunctionObjects);
+        type            residuals;
+        libs            ("libutilityFunctionObjects.so");
         writeControl    timeStep;
         writeInterval   1;
-        fields          (p U k epsilon omega);
-    }
+'''
+            content += f"        fields          {fields};\n"
+            content += '''    }
 '''
 
         # Get boundary names for monitoring
@@ -1142,7 +1226,7 @@ functions
     forces
     {{
         type            forces;
-        libs            (forces);
+        libs            ("libforces.so");
         writeControl    timeStep;
         writeInterval   10;
         patches         ({wall_patches_str});
@@ -1160,7 +1244,7 @@ functions
     inletFlowRate
     {{
         type            surfaceFieldValue;
-        libs            (fieldFunctionObjects);
+        libs            ("libfieldFunctionObjects.so");
         writeControl    timeStep;
         writeInterval   10;
         log             true;
@@ -1178,7 +1262,7 @@ functions
     outletFlowRate
     {{
         type            surfaceFieldValue;
-        libs            (fieldFunctionObjects);
+        libs            ("libfieldFunctionObjects.so");
         writeControl    timeStep;
         writeInterval   10;
         log             true;
@@ -1197,7 +1281,7 @@ functions
     yPlus
     {{
         type            yPlus;
-        libs            (fieldFunctionObjects);
+        libs            ("libfieldFunctionObjects.so");
         writeControl    writeTime;
         patches         ({wall_patches_str});
         log             true;
@@ -1210,7 +1294,7 @@ functions
     fieldAverage1
     {
         type            fieldAverage;
-        libs            (fieldFunctionObjects);
+        libs            ("libfieldFunctionObjects.so");
         writeControl    writeTime;
 
         fields
@@ -1460,6 +1544,19 @@ fluxRequired
     pRefValue       0;"""
 
         if self.config.time_type == TimeType.STEADY:
+            vector_solver_pattern = "(U|k|epsilon|omega)"
+            residual_control_turbulence = '        "(k|epsilon|omega)" 1e-4;\n'
+            relaxation_equations = (
+                f"        U               {urf_U};\n"
+                f"        k               {urf_turb};\n"
+                f"        epsilon         {urf_turb};\n"
+                f"        omega           {urf_turb};\n"
+            )
+            if self.config.turbulence_type == TurbulenceType.LAMINAR:
+                vector_solver_pattern = "U"
+                residual_control_turbulence = ""
+                relaxation_equations = f"        U               {urf_U};\n"
+
             content += f'''
 solvers
 {{
@@ -1477,7 +1574,7 @@ solvers
         relTol          0;
     }}
 
-    "(U|k|epsilon|omega)"
+    "{vector_solver_pattern}"
     {{
         solver          smoothSolver;
         smoother        symGaussSeidel;
@@ -1495,7 +1592,7 @@ SIMPLE
     {{
         p               1e-4;
         U               1e-4;
-        "(k|epsilon|omega)" 1e-4;
+{residual_control_turbulence.rstrip()}
     }}
 }}
 
@@ -1503,10 +1600,7 @@ relaxationFactors
 {{
     equations
     {{
-        U               {urf_U};
-        k               {urf_turb};
-        epsilon         {urf_turb};
-        omega           {urf_turb};
+{relaxation_equations.rstrip()}
     }}
     fields
     {{
@@ -1621,6 +1715,29 @@ solvers
 // ************************************************************************* //
 '''
         else:
+            vector_solver_pattern = "(U|k|epsilon|omega)"
+            vector_solver_final_pattern = "(U|k|epsilon|omega)Final"
+            if self.config.turbulence_type == TurbulenceType.LAMINAR:
+                vector_solver_pattern = "U"
+                vector_solver_final_pattern = "UFinal"
+
+            algorithm_block = f'''
+PIMPLE
+{{
+    nOuterCorrectors 2;
+    nCorrectors     2;
+    nNonOrthogonalCorrectors {n_non_orth_correctors};{pref_block}
+}}
+'''
+            if self.config.solver in {"icoFoam", "pisoFoam"}:
+                algorithm_block = f'''
+PISO
+{{
+    nCorrectors     2;
+    nNonOrthogonalCorrectors {n_non_orth_correctors};{pref_block}
+}}
+'''
+
             content += f'''
 solvers
 {{
@@ -1638,7 +1755,7 @@ solvers
         relTol          0;
     }}
 
-    "(U|k|epsilon|omega)"
+    "{vector_solver_pattern}"
     {{
         solver          smoothSolver;
         smoother        symGaussSeidel;
@@ -1646,19 +1763,13 @@ solvers
         relTol          0.1;
     }}
 
-    "(U|k|epsilon|omega)Final"
+    "{vector_solver_final_pattern}"
     {{
         $U;
         relTol          0;
     }}
 }}
-
-PIMPLE
-{{
-    nOuterCorrectors 2;
-    nCorrectors     2;
-    nNonOrthogonalCorrectors {n_non_orth_correctors};{pref_block}
-}}
+{algorithm_block}
 
 // ************************************************************************* //
 '''
@@ -1703,6 +1814,14 @@ boundary
             content += f"    {name}\n"
             content += f"    {{\n"
             content += f"        type {patch_type};\n"
+            for key, value in patch_info.items():
+                if key in {"type", "faces"}:
+                    continue
+                if isinstance(value, (list, tuple)):
+                    rendered = f"({' '.join(str(item) for item in value)})"
+                else:
+                    rendered = str(value)
+                content += f"        {key} {rendered};\n"
             content += f"        faces\n"
             content += f"        (\n"
 
@@ -2034,6 +2153,7 @@ roots           ();
 
     def _generate_allrun(self) -> str:
         """Generate Allrun script."""
+        solver_token = _sanitize_solver_token_for_script(self.config.solver)
         if self.config.use_snappy and self.config.snappy_params:
             # snappyHexMesh workflow
             script = f'''#!/bin/bash
@@ -2050,7 +2170,7 @@ runApplication snappyHexMesh -overwrite
 runApplication checkMesh
 
 # Run solver
-runApplication {self.config.solver}
+runApplication {solver_token}
 
 #------------------------------------------------------------------------------
 '''
@@ -2063,7 +2183,7 @@ cd "${{0%/*}}" || exit
 runApplication blockMesh
 runApplication checkMesh
 runApplication setFields
-runApplication {self.config.solver}
+runApplication {solver_token}
 
 #------------------------------------------------------------------------------
 '''
@@ -2078,7 +2198,7 @@ cd "${{0%/*}}" || exit
 runApplication blockMesh
 runApplication checkMesh
 runApplication setFields
-runApplication {self.config.solver}
+runApplication {solver_token}
 
 #------------------------------------------------------------------------------
 '''
@@ -2089,7 +2209,7 @@ cd "${{0%/*}}" || exit
 
 runApplication blockMesh
 runApplication checkMesh
-runApplication {self.config.solver}
+runApplication {solver_token}
 
 #------------------------------------------------------------------------------
 '''
@@ -2101,7 +2221,7 @@ cd "${{0%/*}}" || exit
 
 runApplication blockMesh
 runApplication checkMesh
-runApplication {self.config.solver}
+runApplication {solver_token}
 
 #------------------------------------------------------------------------------
 '''
@@ -2139,13 +2259,15 @@ def create_case_config_from_template(
     if template is None:
         raise ValueError(f"Unknown template: {template_id}")
 
+    user_parameters = dict(parameters)
+
     # Validate parameters
-    errors = template.validate_parameters(parameters)
+    errors = template.validate_parameters(user_parameters)
     if errors:
         raise ValueError(f"Parameter validation failed: {'; '.join(errors)}")
 
     # Get fluid properties
-    fluid_name = parameters.get("fluid", "water")
+    fluid_name = user_parameters.get("fluid", "water")
     fluid_props = get_fluid_properties(fluid_name)
     if fluid_props is None:
         fluid_props = {"nu": 1e-6, "rho": 1000}
@@ -2160,33 +2282,38 @@ def create_case_config_from_template(
     # Calculate Reynolds number - handle different template parameter names
     if template_id in ["dam_break", "bubble_rising"]:
         # Multiphase: use characteristic length (tank or column width)
-        char_length = parameters.get("tank_width", parameters.get("column_width", 0.1))
+        char_length = user_parameters.get("tank_width", user_parameters.get("column_width", 0.1))
         char_velocity = 1.0  # Gravity-driven, Re not critical
     elif template_id == "backward_step":
-        char_length = parameters.get("step_height", 0.0127)
-        char_velocity = parameters.get("inlet_velocity", 44.2)
+        char_length = user_parameters.get("step_height", 0.0127)
+        char_velocity = user_parameters.get("inlet_velocity", 44.2)
     elif template_id == "channel_flow":
-        char_length = parameters.get("half_height", 1.0)
+        char_length = _coerce_float_scalar(user_parameters.get("half_height", 1.0), "half_height")
         # For channel flow, use friction Reynolds number to estimate bulk velocity
-        re_tau = parameters.get("re_tau", 395.0)
+        re_tau = _coerce_float_scalar(user_parameters.get("re_tau", 395.0), "re_tau")
         char_velocity = re_tau * fluid_props["nu"] / char_length * 20  # Rough estimate
     elif template_id == "flat_plate":
-        char_length = parameters.get("plate_length", 1.0)
-        char_velocity = parameters.get("inlet_velocity", 10.0)
+        char_length = user_parameters.get("plate_length", 1.0)
+        char_velocity = user_parameters.get("inlet_velocity", 10.0)
     elif template_id == "mixing_elbow":
-        char_length = parameters.get("pipe_diameter", 0.1)
-        char_velocity = parameters.get("inlet_velocity", 1.0)
+        char_length = user_parameters.get("pipe_diameter", 0.1)
+        char_velocity = user_parameters.get("inlet_velocity", 1.0)
     elif template_id == "shock_tube":
-        char_length = parameters.get("tube_length", 10.0)
+        char_length = user_parameters.get("tube_length", 10.0)
         char_velocity = 1.0  # Not relevant for compressible shock problem
     elif template_id == "supersonic_nozzle":
         import math
-        throat_area = parameters.get("throat_area", 0.0005)
+        throat_area = _coerce_float_scalar(user_parameters.get("throat_area", 0.0005), "throat_area")
         char_length = math.sqrt(throat_area)  # Characteristic length from throat
         char_velocity = 1.0  # Not relevant for compressible nozzle
     else:
-        char_length = parameters.get("diameter", parameters.get("width", 0.1))
-        char_velocity = parameters.get("inlet_velocity", parameters.get("lid_velocity", 1.0))
+        char_length = user_parameters.get("diameter", user_parameters.get("width", 0.1))
+        char_velocity = user_parameters.get("inlet_velocity", user_parameters.get("lid_velocity", 1.0))
+
+    char_length = _coerce_float_scalar(char_length, "characteristic_length")
+    if char_length <= 0:
+        raise ValueError("characteristic_length 必须 > 0")
+    char_velocity = _coerce_float_scalar(char_velocity, "characteristic_velocity")
 
     re = estimate_reynolds_number(char_velocity, char_length, fluid_props["nu"])
 
@@ -2199,33 +2326,33 @@ def create_case_config_from_template(
         turbulence = recommend_turbulence_model(re)
 
     # Create boundary definitions based on template
-    boundaries = _create_boundaries_for_template(template_id, parameters)
+    boundaries = _create_boundaries_for_template(template_id, user_parameters)
 
     # Create mesh parameters based on template
-    mesh_params = _create_mesh_for_template(template_id, parameters)
+    mesh_params = _create_mesh_for_template(template_id, user_parameters)
 
     # Control parameters - adjust for different templates
     if flow_type == FlowType.MULTIPHASE:
         control = {
-            "end_time": parameters.get("end_time", 1.0),
+            "end_time": user_parameters.get("end_time", 1.0),
             "delta_t": 0.001,  # Will be adjusted by adaptive time stepping
             "write_interval": 0.05,
         }
     elif flow_type == FlowType.COMPRESSIBLE:
         control = {
-            "end_time": parameters.get("end_time", 0.01),
+            "end_time": user_parameters.get("end_time", 0.01),
             "delta_t": 0.00001,  # Very small for rhoCentralFoam
             "write_interval": 0.001,
         }
     elif template_id == "channel_flow":
         control = {
-            "end_time": parameters.get("end_time", 100.0),
+            "end_time": user_parameters.get("end_time", 100.0),
             "delta_t": 0.001,
             "write_interval": 1.0,
         }
     else:
         control = {
-            "end_time": parameters.get("end_time", 1000 if time_type == TimeType.STEADY else 10),
+            "end_time": user_parameters.get("end_time", 1000 if time_type == TimeType.STEADY else 10),
             "delta_t": 1 if time_type == TimeType.STEADY else 0.001,
             "write_interval": 100 if time_type == TimeType.STEADY else 0.1,
         }
@@ -2234,7 +2361,8 @@ def create_case_config_from_template(
     is_closed = template_id in ["cavity_flow", "natural_convection"]
 
     # Store template_id in geometry_params for later use
-    parameters["template_id"] = template_id
+    geometry_params = dict(user_parameters)
+    geometry_params["template_id"] = template_id
 
     return CaseConfig(
         case_path=Path(case_path),
@@ -2244,7 +2372,7 @@ def create_case_config_from_template(
         turbulence_type=turbulence,
         is_2d=template.is_2d,
         fluid_properties=fluid_props,
-        geometry_params=parameters,
+        geometry_params=geometry_params,
         boundary_definitions=boundaries,
         mesh_params=mesh_params,
         control_params=control,

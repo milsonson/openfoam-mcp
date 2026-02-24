@@ -7,6 +7,7 @@ and run OpenFOAM CFD simulations through natural language interaction.
 """
 
 import asyncio
+import time
 
 from mcp.server.fastmcp import FastMCP
 
@@ -131,6 +132,33 @@ mcp = FastMCP(
 register_custom_routes(mcp)
 
 
+_TOOL_CLEANUP_INTERVAL_SECONDS = 300.0
+_last_tool_cleanup_at = 0.0
+
+
+async def _run_tool(func, *args) -> str:
+    """Execute tool in a worker thread with periodic artifact cleanup and safe errors."""
+    global _last_tool_cleanup_at
+
+    now = time.monotonic()
+    if now - _last_tool_cleanup_at >= _TOOL_CLEANUP_INTERVAL_SECONDS:
+        try:
+            await asyncio.to_thread(
+                cleanup_old_job_dirs,
+                ttl_seconds=_SERVER_CONFIG.artifact_ttl_seconds,
+                max_jobs=_SERVER_CONFIG.artifact_max_jobs,
+            )
+        except Exception:
+            # Cleanup failures should not block tool serving.
+            pass
+        _last_tool_cleanup_at = now
+
+    try:
+        return await asyncio.to_thread(func, *args)
+    except Exception as exc:
+        return f"错误: {exc}"
+
+
 # ============================================================================
 # Tool Registrations
 # ============================================================================
@@ -146,7 +174,7 @@ register_custom_routes(mcp)
     }
 )
 async def list_templates_tool(params: ListTemplatesInput) -> str:
-    return await asyncio.to_thread(openfoam_list_templates, params)
+    return await _run_tool(openfoam_list_templates, params)
 
 
 @mcp.tool(
@@ -160,7 +188,7 @@ async def list_templates_tool(params: ListTemplatesInput) -> str:
     }
 )
 async def get_template_info_tool(params: GetTemplateInfoInput) -> str:
-    return await asyncio.to_thread(openfoam_get_template_info, params)
+    return await _run_tool(openfoam_get_template_info, params)
 
 
 @mcp.tool(
@@ -174,7 +202,7 @@ async def get_template_info_tool(params: GetTemplateInfoInput) -> str:
     }
 )
 async def create_case_tool(params: CreateCaseInput) -> str:
-    return await asyncio.to_thread(openfoam_create_case, params)
+    return await _run_tool(openfoam_create_case, params)
 
 
 @mcp.tool(
@@ -188,7 +216,7 @@ async def create_case_tool(params: CreateCaseInput) -> str:
     }
 )
 async def validate_case_tool(params: ValidateCaseInput) -> str:
-    return await asyncio.to_thread(openfoam_validate_case, params)
+    return await _run_tool(openfoam_validate_case, params)
 
 
 @mcp.tool(
@@ -202,7 +230,7 @@ async def validate_case_tool(params: ValidateCaseInput) -> str:
     }
 )
 async def run_solver_tool(params: RunSolverInput) -> str:
-    return await asyncio.to_thread(openfoam_run_solver, params)
+    return await _run_tool(openfoam_run_solver, params)
 
 
 @mcp.tool(
@@ -216,7 +244,7 @@ async def run_solver_tool(params: RunSolverInput) -> str:
     }
 )
 async def analyze_problem_tool(params: AnalyzeProblemInput) -> str:
-    return await asyncio.to_thread(openfoam_analyze_problem, params)
+    return await _run_tool(openfoam_analyze_problem, params)
 
 
 @mcp.tool(
@@ -232,7 +260,7 @@ async def analyze_problem_tool(params: AnalyzeProblemInput) -> str:
 async def get_fluid_properties_tool(fluid_name: str) -> str:
     name_map = {"水": "water", "空气": "air", "油": "oil"}
     fluid = name_map.get(fluid_name, fluid_name.lower())
-    return await asyncio.to_thread(openfoam_get_fluid_properties, fluid)
+    return await _run_tool(openfoam_get_fluid_properties, fluid)
 
 
 @mcp.tool(
@@ -246,7 +274,7 @@ async def get_fluid_properties_tool(fluid_name: str) -> str:
     }
 )
 async def generate_mesh_tool(params: GenerateMeshInput) -> str:
-    return await asyncio.to_thread(openfoam_generate_mesh, params)
+    return await _run_tool(openfoam_generate_mesh, params)
 
 
 @mcp.tool(
@@ -260,7 +288,7 @@ async def generate_mesh_tool(params: GenerateMeshInput) -> str:
     }
 )
 async def generate_boundary_conditions_tool(params: GenerateBoundaryConditionsInput) -> str:
-    return await asyncio.to_thread(openfoam_generate_boundary_conditions, params)
+    return await _run_tool(openfoam_generate_boundary_conditions, params)
 
 
 @mcp.tool(
@@ -274,7 +302,7 @@ async def generate_boundary_conditions_tool(params: GenerateBoundaryConditionsIn
     }
 )
 async def get_run_status_tool(params: GetRunStatusInput) -> str:
-    return await asyncio.to_thread(openfoam_get_run_status, params)
+    return await _run_tool(openfoam_get_run_status, params)
 
 
 @mcp.tool(
@@ -288,7 +316,7 @@ async def get_run_status_tool(params: GetRunStatusInput) -> str:
     }
 )
 async def run_parallel_tool(params: RunParallelInput) -> str:
-    return await asyncio.to_thread(openfoam_run_parallel, params)
+    return await _run_tool(openfoam_run_parallel, params)
 
 
 @mcp.tool(
@@ -302,7 +330,7 @@ async def run_parallel_tool(params: RunParallelInput) -> str:
     }
 )
 async def generate_residual_plot_tool(params: GenerateResidualPlotInput) -> str:
-    return await asyncio.to_thread(openfoam_generate_residual_plot, params)
+    return await _run_tool(openfoam_generate_residual_plot, params)
 
 
 @mcp.tool(
@@ -316,7 +344,7 @@ async def generate_residual_plot_tool(params: GenerateResidualPlotInput) -> str:
     }
 )
 async def calculate_yplus_tool(params: CalculateYplusInput) -> str:
-    return await asyncio.to_thread(openfoam_calculate_yplus, params)
+    return await _run_tool(openfoam_calculate_yplus, params)
 
 
 @mcp.tool(
@@ -330,7 +358,7 @@ async def calculate_yplus_tool(params: CalculateYplusInput) -> str:
     }
 )
 async def search_tutorials_tool(params: SearchTutorialsInput) -> str:
-    return await asyncio.to_thread(openfoam_search_tutorials, params)
+    return await _run_tool(openfoam_search_tutorials, params)
 
 
 @mcp.tool(
@@ -344,7 +372,7 @@ async def search_tutorials_tool(params: SearchTutorialsInput) -> str:
     }
 )
 async def read_tutorial_file_tool(params: ReadTutorialFileInput) -> str:
-    return await asyncio.to_thread(openfoam_read_tutorial_file, params)
+    return await _run_tool(openfoam_read_tutorial_file, params)
 
 
 @mcp.tool(
@@ -358,7 +386,7 @@ async def read_tutorial_file_tool(params: ReadTutorialFileInput) -> str:
     }
 )
 async def get_patch_list_tool(params: GetPatchListInput) -> str:
-    return await asyncio.to_thread(openfoam_get_patch_list, params)
+    return await _run_tool(openfoam_get_patch_list, params)
 
 
 @mcp.tool(
@@ -372,7 +400,7 @@ async def get_patch_list_tool(params: GetPatchListInput) -> str:
     }
 )
 async def read_dictionary_tool(params: ReadDictionaryInput) -> str:
-    return await asyncio.to_thread(openfoam_read_dictionary, params)
+    return await _run_tool(openfoam_read_dictionary, params)
 
 
 @mcp.tool(
@@ -386,7 +414,7 @@ async def read_dictionary_tool(params: ReadDictionaryInput) -> str:
     }
 )
 async def update_dictionary_tool(params: UpdateDictionaryInput) -> str:
-    return await asyncio.to_thread(openfoam_update_dictionary, params)
+    return await _run_tool(openfoam_update_dictionary, params)
 
 
 @mcp.tool(
@@ -400,7 +428,7 @@ async def update_dictionary_tool(params: UpdateDictionaryInput) -> str:
     }
 )
 async def preflight_check_tool(params: PreflightCheckInput) -> str:
-    return await asyncio.to_thread(openfoam_preflight_check, params)
+    return await _run_tool(openfoam_preflight_check, params)
 
 
 @mcp.tool(
@@ -414,7 +442,7 @@ async def preflight_check_tool(params: PreflightCheckInput) -> str:
     }
 )
 async def assess_case_stability_tool(params: AssessCaseStabilityInput) -> str:
-    return await asyncio.to_thread(openfoam_assess_case_stability, params)
+    return await _run_tool(openfoam_assess_case_stability, params)
 
 
 @mcp.tool(
@@ -428,7 +456,7 @@ async def assess_case_stability_tool(params: AssessCaseStabilityInput) -> str:
     }
 )
 async def apply_stability_fixes_tool(params: ApplyStabilityFixesInput) -> str:
-    return await asyncio.to_thread(openfoam_apply_stability_fixes, params)
+    return await _run_tool(openfoam_apply_stability_fixes, params)
 
 
 @mcp.tool(
@@ -442,7 +470,7 @@ async def apply_stability_fixes_tool(params: ApplyStabilityFixesInput) -> str:
     }
 )
 async def generate_modeling_plan_tool(params: GenerateModelingPlanInput) -> str:
-    return await asyncio.to_thread(openfoam_generate_modeling_plan, params)
+    return await _run_tool(openfoam_generate_modeling_plan, params)
 
 
 @mcp.tool(
@@ -456,7 +484,7 @@ async def generate_modeling_plan_tool(params: GenerateModelingPlanInput) -> str:
     }
 )
 async def run_workflow_from_prompt_tool(params: RunWorkflowFromPromptInput) -> str:
-    return await asyncio.to_thread(openfoam_run_workflow_from_prompt, params)
+    return await _run_tool(openfoam_run_workflow_from_prompt, params)
 
 
 def main():

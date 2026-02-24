@@ -75,6 +75,12 @@ WORKFLOW_LONG_STRING_TRIM = 3000
 WORKFLOW_MAX_LIST_ITEMS = 100
 
 
+def _contains_missing_metis_error(*messages: Optional[str]) -> bool:
+    """Detect decomposePar failures caused by missing metis decomposition library."""
+    haystack = "\n".join(msg for msg in messages if msg).lower()
+    return "libmetisdecomp.so" in haystack or ("metis" in haystack and "decompose" in haystack)
+
+
 class KPISummary(TypedDict):
     """Key metrics extracted from workflow execution."""
 
@@ -961,7 +967,32 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
     case_path = Path(resolved_case_path)
     case_existed = case_path.exists()
     _emit_event(stage="create_case", status="running", message="开始生成案例文件", progress=20)
-    case_path.mkdir(parents=True, exist_ok=True)
+    try:
+        if case_path.exists() and not case_path.is_dir():
+            raise ValueError(f"case_path 已存在且不是目录: {resolved_case_path}")
+        case_path.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        _emit_event(
+            stage="create_case",
+            status="failed",
+            message=f"创建案例目录失败: {exc}",
+            progress=100,
+        )
+        base_payload = _with_common_fields(
+            {
+                "status": "failed",
+                "stage": "create_case",
+                "case_path": resolved_case_path,
+                "error": str(exc),
+                "plan": plan,
+            }
+        )
+        base_payload["artifacts"] = list_job_artifacts(job_id)
+        manifest_state.update(base_payload)
+        write_job_manifest(job_id, manifest_state)
+        if params.response_format == ResponseFormat.JSON:
+            return _serialize_json_response(base_payload)
+        return _truncate_text_response(f"创建案例目录失败: {exc}")
 
     template_id = str(plan["template_id"])
     plan_parameters = dict(plan["parameters"])
@@ -1127,7 +1158,7 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
                 decompose_result = decompose_case(
                     case_path=resolved_case_path,
                     n_processors=params.n_processors,
-                    method="scotch",
+                    method="simple",
                     timeout=min(params.timeout, 900.0),
                     force=True,
                 )
@@ -1151,7 +1182,23 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
                         )
                         solver_result["reconstruct"] = _run_result_to_dict(reconstruct_result)
                 else:
-                    solver_result["status"] = RunStatus.FAILED.value
+                    fallback_reason = "decompose_failed"
+                    if _contains_missing_metis_error(
+                        decompose_result.error_message,
+                        decompose_result.stderr,
+                        decompose_result.stdout,
+                    ):
+                        fallback_reason = "missing_metis_decomposer"
+
+                    serial_result = run_solver(
+                        case_path=resolved_case_path,
+                        solver=solver_cmd,
+                        timeout=params.timeout,
+                    )
+                    solver_result["status"] = serial_result.status.value
+                    solver_result["solve"] = _run_result_to_dict(serial_result)
+                    solver_result["execution_mode"] = "serial_fallback"
+                    solver_result["fallback_reason"] = fallback_reason
             else:
                 solver_result = {
                     "status": "skipped",
@@ -1206,6 +1253,8 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
         failure_reasons.append("solver_failed")
     elif params.run_solver and solver_status in {"skipped", "cancelled"}:
         warning_reasons.append("solver_not_executed")
+    if params.run_solver and params.run_parallel and solver_result.get("execution_mode") == "serial_fallback":
+        warning_reasons.append("parallel_fallback_to_serial")
 
     if failure_reasons:
         status = "partial_failed"

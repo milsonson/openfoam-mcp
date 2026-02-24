@@ -9,7 +9,7 @@ from pathlib import Path
 # Ensure repo root is importable when running this test file directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.core.runner import RunResult, RunStatus
+from src.core.runner import RunResult, RunStatus, SolverRunner, run_solver as core_run_solver
 from src.tools.case_tools import (
     RunParallelInput,
     RunSolverInput,
@@ -66,6 +66,19 @@ def _completed_result(
         duration_seconds=duration,
         final_residuals=residuals or {"U": 1e-6},
         converged=True,
+    )
+
+
+def _failed_result(*, error: str, stdout: str = "", stderr: str = "") -> RunResult:
+    return RunResult(
+        status=RunStatus.FAILED,
+        return_code=1,
+        stdout=stdout,
+        stderr=stderr,
+        duration_seconds=0.1,
+        final_residuals={},
+        converged=False,
+        error_message=error,
     )
 
 
@@ -174,6 +187,43 @@ def test_run_parallel_auto_mesh_and_fallback_to_serial_when_parallel_deps_missin
     assert "✅ 串行求解完成" in result
 
 
+def test_core_run_solver_persists_log_file_for_status_tools(tmp_path: Path, monkeypatch) -> None:
+    case_path = tmp_path / "core_solver_case"
+    _create_case(case_path)
+
+    expected = RunResult(
+        status=RunStatus.COMPLETED,
+        return_code=0,
+        stdout=(
+            "Time = 1\n"
+            "Solving for p, Initial residual = 0.1, Final residual = 0.01, No Iterations 1\n"
+            "End\n"
+        ),
+        stderr="",
+        duration_seconds=0.2,
+        final_residuals={"p": 1e-2},
+        converged=True,
+    )
+
+    monkeypatch.setattr("src.core.runner.SolverRunner.run_command", lambda self, *_args, **_kwargs: expected)
+
+    result = core_run_solver(str(case_path), "simpleFoam", timeout=120)
+    assert result.status == RunStatus.COMPLETED
+
+    log_file = case_path / "log.simpleFoam"
+    assert log_file.exists()
+    log_text = log_file.read_text(encoding="utf-8")
+    assert "Solving for p" in log_text
+
+
+def test_check_convergence_requires_residuals_for_end_marker(tmp_path: Path) -> None:
+    """An End marker without parsed residuals should not be treated as converged."""
+    runner = SolverRunner(str(tmp_path))
+    runner.progress.residuals = {}
+
+    assert runner._check_convergence("Time = 1\nEnd\n") is False
+
+
 def test_workflow_without_execution_has_non_blocking_preflight(tmp_path: Path) -> None:
     case_path = tmp_path / "workflow_case"
     result = openfoam_run_workflow_from_prompt(
@@ -216,3 +266,57 @@ def test_workflow_solver_requested_without_solver_command_sets_warning_status(
     assert payload["preflight"]["profile"] == "solver"
     assert payload["solver_run"]["status"] == "skipped"
     assert payload["status"] == "completed_with_warnings"
+
+
+def test_workflow_parallel_fallbacks_to_serial_when_metis_is_missing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    case_path = tmp_path / "workflow_parallel_case"
+
+    def fake_resolve_command(cmd: str) -> str | None:
+        return {
+            "simpleFoam": "/opt/openfoam/bin/simpleFoam",
+            "mpirun": "/usr/bin/mpirun",
+            "decomposePar": "/opt/openfoam/bin/decomposePar",
+            "reconstructPar": "/opt/openfoam/bin/reconstructPar",
+        }.get(cmd)
+
+    def fake_decompose_case(*_args, **_kwargs) -> RunResult:
+        return _failed_result(
+            error="error while loading shared libraries: libmetisDecomp.so",
+            stderr="error while loading shared libraries: libmetisDecomp.so",
+        )
+
+    serial_called = {"count": 0}
+
+    def fake_run_solver(*_args, **_kwargs) -> RunResult:
+        serial_called["count"] += 1
+        return _completed_result(residuals={"U": 1e-6, "p": 1e-5})
+
+    def fail_parallel(*_args, **_kwargs) -> RunResult:
+        raise AssertionError("parallel solver should not run when decomposePar fails")
+
+    monkeypatch.setattr("src.tools.workflow_tools.resolve_openfoam_command", fake_resolve_command)
+    monkeypatch.setattr("src.tools.workflow_tools.decompose_case", fake_decompose_case)
+    monkeypatch.setattr("src.tools.workflow_tools.run_solver", fake_run_solver)
+    monkeypatch.setattr("src.tools.workflow_tools.run_parallel", fail_parallel)
+
+    result = openfoam_run_workflow_from_prompt(
+        RunWorkflowFromPromptInput(
+            description="模拟水在直径5cm、长度50cm的管道中以1m/s流动",
+            case_path=str(case_path),
+            run_mesh=False,
+            run_solver=True,
+            run_parallel=True,
+            auto_apply_stability_fixes=False,
+            response_format="json",
+        )
+    )
+    payload = json.loads(result)
+
+    assert serial_called["count"] == 1
+    assert payload["solver_run"]["status"] == RunStatus.COMPLETED.value
+    assert payload["solver_run"]["execution_mode"] == "serial_fallback"
+    assert payload["solver_run"]["fallback_reason"] == "missing_metis_decomposer"
+    assert "parallel_fallback_to_serial" in payload["warnings"]

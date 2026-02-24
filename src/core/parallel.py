@@ -6,7 +6,7 @@ import subprocess
 import re
 
 from ..io_utils import atomic_write_text
-from .runner import RunResult, RunStatus, SolverRunner
+from .runner import RunResult, RunStatus, SolverRunner, persist_solver_log
 
 _SAFE_SOLVER_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*$")
 _UNSAFE_SHELL_FRAGMENT_RE = re.compile(r"[;&|`<>]")
@@ -38,20 +38,26 @@ def _validate_parallel_solver(solver: str) -> str:
 def _resolve_hostfile(case_path: str, hostfile: str) -> str:
     """Resolve and validate hostfile path under case directory."""
     case_root = Path(case_path).resolve()
-    candidate = Path(hostfile).expanduser()
+    candidate = Path(hostfile)
     candidate_abs = candidate if candidate.is_absolute() else (case_root / candidate)
 
     if candidate_abs.exists() and candidate_abs.is_symlink():
         raise ValueError("hostfile 不能是符号链接")
 
-    resolved = candidate_abs.resolve()
+    try:
+        resolved = candidate_abs.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise ValueError(f"hostfile 不存在或不是文件: {candidate_abs}") from exc
+
+    if resolved.is_symlink():
+        raise ValueError("hostfile 不能是符号链接")
 
     try:
         resolved.relative_to(case_root)
     except ValueError as exc:
         raise ValueError("hostfile 必须位于案例目录内") from exc
 
-    if not resolved.exists() or not resolved.is_file():
+    if not resolved.is_file():
         raise ValueError(f"hostfile 不存在或不是文件: {resolved}")
     return str(resolved)
 
@@ -169,20 +175,33 @@ def decompose_case(
     """
     # Ensure decomposeParDict exists and matches requested processor count.
     decompose_dict = Path(case_path) / "system" / "decomposeParDict"
+
+    simple_n = _factorize_processors(n_processors)
+    simple_entries = [
+        f"n               ({simple_n[0]} {simple_n[1]} {simple_n[2]});",
+        "delta           0.001;",
+    ]
+    hierarchical_entries = [
+        f"n               ({simple_n[0]} {simple_n[1]} {simple_n[2]});",
+        "delta           0.001;",
+        "order           xyz;",
+    ]
+    scotch_entries = [f"processorWeights ({' '.join(['1'] * n_processors)});"]
+
     if decompose_dict.exists():
         content = decompose_dict.read_text(encoding="utf-8", errors="replace")
         content = _upsert_entry(content, "numberOfSubdomains", str(n_processors))
         content = _upsert_entry(content, "method", method)
+        for block in ("simpleCoeffs", "hierarchicalCoeffs", "scotchCoeffs", "metisCoeffs"):
+            content = _remove_named_block(content, block)
 
-        if method == "scotch":
-            weights = " ".join(["1"] * n_processors)
-            content = _remove_named_block(content, "simpleCoeffs")
-            content = _remove_named_block(content, "hierarchicalCoeffs")
-            content = _upsert_named_block(
-                content,
-                "scotchCoeffs",
-                [f"processorWeights ({weights});"],
-            )
+        if method == "simple":
+            content = _upsert_named_block(content, "simpleCoeffs", simple_entries)
+        elif method == "hierarchical":
+            content = _upsert_named_block(content, "hierarchicalCoeffs", hierarchical_entries)
+        elif method == "scotch":
+            content = _upsert_named_block(content, "scotchCoeffs", scotch_entries)
+
         atomic_write_text(decompose_dict, content)
     else:
         content = _generate_decompose_par_dict_content(n_processors, method)
@@ -253,7 +272,9 @@ def run_parallel(
 
     # Use mpirun to run the solver
     runner = SolverRunner(case_path)
-    return runner.run_command("mpirun", args=args, timeout=timeout, on_progress=on_progress)
+    result = runner.run_command("mpirun", args=args, timeout=timeout, on_progress=on_progress)
+    persist_solver_log(case_path, safe_solver, result)
+    return result
 
 
 def _generate_decompose_par_dict_content(n_processors: int = 4, method: str = "scotch") -> str:
