@@ -1166,5 +1166,11 @@ def get_template_summary(template: CaseTemplate) -> str:
         lines.append("### 可选参数:")
         for param in optional:
             lines.append(f"- {param.label} ({param.name}): {param.description}")
+            if param.unit:
+                lines.append(f"  单位: {param.unit}")
+            if param.default is not None:
+                lines.append(f"  默认: {param.default}")
+            if param.choices:
+                lines.append(f"  可选: {', '.join(param.choices)}")
 
     return "\n".join(lines)

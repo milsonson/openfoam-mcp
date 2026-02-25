@@ -123,6 +123,36 @@ def test_generate_modeling_plan_returns_needs_input_for_ambiguous_prompt() -> No
     assert data["confidence"] < 0.6
 
 
+def test_generate_modeling_plan_unknown_prompt_includes_clarification_reason() -> None:
+    result = openfoam_generate_modeling_plan(
+        GenerateModelingPlanInput(
+            description="simulate flow",
+            response_format="json",
+        )
+    )
+
+    data = json.loads(result)
+    assert data["status"] == "needs_input"
+    assert data["classification_status"] == "unknown"
+    assert "template_unknown" in data["needs_clarification_reasons"]
+
+
+def test_generate_modeling_plan_recognizes_template_id_tokens_in_english() -> None:
+    result = openfoam_generate_modeling_plan(
+        GenerateModelingPlanInput(
+            description=(
+                "Create a cavity_flow case with water, width 0.1 m, height 0.1 m, "
+                "lid velocity 1 m/s, end time 0.05"
+            ),
+            response_format="json",
+        )
+    )
+
+    data = json.loads(result)
+    assert data["status"] == "ready"
+    assert data["template_id"] == "cavity_flow"
+
+
 def test_apply_stability_fixes_transient_case_updates_control_and_algorithm(tmp_path: Path) -> None:
     case_path = tmp_path / "transient_case"
     _write_min_case(case_path, solver="interFoam")

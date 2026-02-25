@@ -606,11 +606,38 @@ def _build_modeling_plan(description: str) -> Dict[str, Any]:
             "raw_analysis": analysis_text,
         }
 
+    classification_status_raw = analysis.get("classification_status", "unknown")
+    classification_status = str(classification_status_raw)
+    raw_confidence = analysis.get("template_confidence")
+    try:
+        confidence = float(raw_confidence)
+    except (TypeError, ValueError):
+        confidence = 0.0
+
+    candidate_templates = analysis.get("template_candidates") or []
+    if not isinstance(candidate_templates, list):
+        candidate_templates = []
+
     template_id = analysis.get("suggested_template")
     if not template_id:
+        clarification_reasons: List[str] = []
+        if classification_status == "unknown":
+            clarification_reasons.append("template_unknown")
+        if classification_status == "low_confidence":
+            clarification_reasons.append("template_low_confidence")
         return {
             "status": "needs_input",
             "message": "无法自动识别模板，请手动指定 template_id",
+            "template_id": "unknown",
+            "template_name": "unknown",
+            "classification_status": classification_status,
+            "confidence": round(confidence, 3),
+            "candidate_templates": candidate_templates[:3],
+            "parameters": {},
+            "auto_filled": {},
+            "missing_required": [],
+            "validation_errors": [],
+            "needs_clarification_reasons": clarification_reasons or ["template_unknown"],
             "raw_analysis": analysis,
         }
 
@@ -622,17 +649,8 @@ def _build_modeling_plan(description: str) -> Dict[str, Any]:
             "raw_analysis": analysis,
         }
 
-    classification_status_raw = analysis.get("classification_status", "ok")
-    classification_status = str(classification_status_raw)
-    raw_confidence = analysis.get("template_confidence")
-    try:
-        confidence = float(raw_confidence)
-    except (TypeError, ValueError):
+    if confidence <= 0:
         confidence = 1.0 if template_id else 0.0
-
-    candidate_templates = analysis.get("template_candidates") or []
-    if not isinstance(candidate_templates, list):
-        candidate_templates = []
 
     merged_parameters: Dict[str, Any] = {}
     geometry_params = analysis.get("geometry_params") or {}

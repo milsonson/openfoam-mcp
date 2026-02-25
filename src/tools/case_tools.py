@@ -259,6 +259,19 @@ def _classify_template_from_description(description: str) -> Dict[str, Any]:
     for template_id, rules in _TEMPLATE_CLASSIFICATION_RULES.items():
         score = 0.0
         matched_rules: list[str] = []
+
+        # Strong signal: user explicitly names template id token.
+        explicit_tokens = (
+            template_id.lower(),
+            template_id.lower().replace("_", "-"),
+            template_id.lower().replace("_", " "),
+        )
+        for token in explicit_tokens:
+            if token and token in desc:
+                score += 4.0
+                matched_rules.append(f"template_id:{token}")
+                break
+
         for pattern, weight in rules:
             if re.search(pattern, desc):
                 score += weight
@@ -1519,7 +1532,8 @@ def openfoam_get_run_status(params: GetRunStatusInput) -> str:
 
         for line in recent_lines:
             # Parse time
-            time_match = re.search(r'Time\s*=\s*([\d.e+-]+)', line)
+            # Keep this anchored to avoid matching "ExecutionTime = ..."
+            time_match = re.search(r'^\s*Time\s*=\s*([\d.e+-]+)\b', line)
             if time_match:
                 status_info["current_time"] = float(time_match.group(1))
 

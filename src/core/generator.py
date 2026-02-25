@@ -1057,7 +1057,7 @@ thermoType
     thermo          hConst;
     equationOfState perfectGas;
     specie          specie;
-    energy          sensibleEnthalpy;
+    energy          sensibleInternalEnergy;
 }}
 
 mixture
@@ -1710,6 +1710,13 @@ solvers
         tolerance       1e-10;
         relTol          0;
     }}
+}}
+
+PIMPLE
+{{
+    nOuterCorrectors 1;
+    nCorrectors 2;
+    nNonOrthogonalCorrectors {n_non_orth_correctors};
 }}
 
 // ************************************************************************* //

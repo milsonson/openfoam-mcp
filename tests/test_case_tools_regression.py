@@ -123,3 +123,32 @@ def test_analyze_problem_does_not_misclassify_soil_as_oil() -> None:
         )
     )
     assert '"fluid": "oil"' not in result
+
+
+def test_shock_tube_case_uses_internal_energy_and_pimple_block(tmp_path: Path) -> None:
+    """shock_tube template should generate rhoCentralFoam-compatible dictionaries."""
+    case_path = tmp_path / "shock_tube_case"
+    result = openfoam_create_case(
+        CreateCaseInput(
+            template_id="shock_tube",
+            case_path=str(case_path),
+            parameters={
+                "tube_length": 1.0,
+                "diaphragm_position": 0.5,
+                "left_pressure": 100000.0,
+                "right_pressure": 10000.0,
+                "left_temperature": 348.432,
+                "right_temperature": 278.746,
+                "mesh_density": "coarse",
+                "end_time": 0.0002,
+            },
+            run_mesh=False,
+            run_validation=False,
+        )
+    )
+
+    assert "# 案例创建成功" in result
+    thermo = (case_path / "constant" / "thermophysicalProperties").read_text(encoding="utf-8")
+    fv_solution = (case_path / "system" / "fvSolution").read_text(encoding="utf-8")
+    assert "energy          sensibleInternalEnergy;" in thermo
+    assert "PIMPLE" in fv_solution

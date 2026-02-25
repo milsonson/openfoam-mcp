@@ -8,6 +8,7 @@ from shutil import which
 import json
 import os
 import re
+import subprocess
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -177,6 +178,28 @@ def _extract_block(content: str, block_name: str) -> Optional[str]:
 def _extract_application(control_dict: str) -> Optional[str]:
     """Extract solver name from controlDict application entry."""
     return _extract_word_value(control_dict, "application")
+
+
+def _probe_command_runtime_issue(command: str, resolved_path: str) -> Optional[str]:
+    """Probe command load-time/runtime issues that `which` cannot detect."""
+    if command != "decomposePar":
+        return None
+
+    try:
+        proc = subprocess.run(
+            [resolved_path, "-help"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return None
+
+    output = f"{proc.stdout}\n{proc.stderr}".lower()
+    if "libmetisdecomp.so" in output and "metis" in output:
+        return "运行时缺少 libmetisDecomp.so（并行分解可能失败）"
+    return None
 
 
 def _has_function_object_type(control_dict: str, object_type: str) -> bool:
@@ -398,11 +421,22 @@ def openfoam_preflight_check(params: PreflightCheckInput) -> str:
     for cmd in deduped_commands:
         path = which(cmd)
         required = cmd in required_commands
+        runtime_issue: Optional[str] = None
+        if path and cmd == "decomposePar" and (params.profile == "parallel" or params.n_processors):
+            runtime_issue = _probe_command_runtime_issue(cmd, path)
+
+        status = "ok" if path else ("error" if required else "warning")
+        detail = path or ""
+        if runtime_issue:
+            status = "error" if required else "warning"
+            detail = runtime_issue
+
         command_checks.append(
             {
                 "command": cmd,
-                "status": "ok" if path else ("error" if required else "warning"),
+                "status": status,
                 "path": path or "",
+                "detail": detail,
                 "required": "yes" if required else "no",
             }
         )
@@ -453,7 +487,7 @@ def openfoam_preflight_check(params: PreflightCheckInput) -> str:
                 checks,
                 "error",
                 f"命令 {item['command']}",
-                "不可用",
+                item.get("detail") or "不可用",
                 suggestion="请先 source OpenFOAM 环境配置（etc/bashrc）",
             )
         elif item["status"] == "warning":
@@ -461,7 +495,7 @@ def openfoam_preflight_check(params: PreflightCheckInput) -> str:
                 checks,
                 "warning",
                 f"命令 {item['command']}",
-                "当前场景非阻塞缺失",
+                item.get("detail") or "当前场景非阻塞缺失",
                 suggestion="若要执行相关阶段，请先 source OpenFOAM 环境配置（etc/bashrc）",
             )
         else:
@@ -529,7 +563,7 @@ def openfoam_preflight_check(params: PreflightCheckInput) -> str:
     lines.append("## 命令检查")
     for item in command_checks:
         icon = "✅" if item["status"] == "ok" else ("❌" if item["status"] == "error" else "⚠️")
-        detail = item["path"] if item["path"] else "未找到可执行文件"
+        detail = item.get("detail") or (item["path"] if item["path"] else "未找到可执行文件")
         marker = " (必需)" if item["required"] == "yes" else ""
         lines.append(f"- {icon} `{item['command']}`{marker}: {detail}")
 

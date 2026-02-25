@@ -74,6 +74,52 @@ class CaseValidator:
     def __init__(self, case_path: str):
         self.case_path = Path(case_path)
         self.results: List[ValidationResult] = []
+        self._cached_solver: Optional[str] = None
+
+    def _detect_solver_from_control_dict(self) -> str:
+        """Best-effort solver detection from system/controlDict."""
+        if self._cached_solver is not None:
+            return self._cached_solver
+
+        solver = ""
+        control_file = self.case_path / "system" / "controlDict"
+        if control_file.exists():
+            try:
+                content = control_file.read_text(encoding="utf-8", errors="replace")
+                match = re.search(r"\bapplication\s+([^;\s]+)\s*;", content)
+                if match:
+                    solver = match.group(1).strip()
+            except Exception:
+                solver = ""
+
+        self._cached_solver = solver
+        return solver
+
+    def _is_rho_central_case(self) -> bool:
+        """Identify rhoCentralFoam-style compressible cases."""
+        solver = self._detect_solver_from_control_dict().lower()
+        if solver == "rhocentralfoam":
+            return True
+
+        thermo_file = self.case_path / "constant" / "thermophysicalProperties"
+        transport_file = self.case_path / "constant" / "transportProperties"
+        return thermo_file.exists() and not transport_file.exists()
+
+    def _required_files(self) -> List[str]:
+        """Compute required files by solver/type to reduce false positives."""
+        common = ["system/controlDict", "system/fvSchemes", "system/fvSolution", "0/U", "0/p"]
+        if self._is_rho_central_case():
+            return common + ["0/T", "constant/thermophysicalProperties"]
+        return common + ["constant/transportProperties"]
+
+    def _syntax_files(self) -> List[str]:
+        """Dictionary files that should pass basic syntax checks."""
+        files = ["system/controlDict", "system/fvSchemes", "system/fvSolution"]
+        if self._is_rho_central_case():
+            files.append("constant/thermophysicalProperties")
+        else:
+            files.append("constant/transportProperties")
+        return files
 
     def validate_all(self, run_openfoam_checks: bool = True) -> ValidationReport:
         """Run all validation checks."""
@@ -99,11 +145,7 @@ class CaseValidator:
     def _validate_directory_structure(self):
         """Check that required directories and files exist."""
         required_dirs = ["0", "constant", "system"]
-        required_files = [
-            "0/U", "0/p",
-            "constant/transportProperties",
-            "system/controlDict", "system/fvSchemes", "system/fvSolution"
-        ]
+        required_files = self._required_files()
 
         for dir_name in required_dirs:
             dir_path = self.case_path / dir_name
@@ -135,12 +177,7 @@ class CaseValidator:
 
     def _validate_file_syntax(self):
         """Validate OpenFOAM dictionary syntax."""
-        dict_files = [
-            "system/controlDict",
-            "system/fvSchemes",
-            "system/fvSolution",
-            "constant/transportProperties",
-        ]
+        dict_files = self._syntax_files()
 
         for file_name in dict_files:
             file_path = self.case_path / file_name
@@ -213,20 +250,23 @@ class CaseValidator:
         if not zero_dir.exists():
             return
 
+        core_fields = {"U", "p", "T", "p_rgh", "alpha.water", "e", "h", "rho"}
+
         for field_file in zero_dir.iterdir():
             if field_file.is_file():
                 try:
-                    content = field_file.read_text()
+                    content = field_file.read_text(encoding="utf-8", errors="replace")
                     field_boundaries = self._extract_boundaries_from_field(content)
 
                     # Check for missing boundaries
                     missing = mesh_boundaries - field_boundaries
                     if missing:
+                        severity = "error" if field_file.name in core_fields else "warning"
                         self.results.append(ValidationResult(
                             passed=False,
                             message=f"{field_file.name} 缺少边界定义",
-                            details=f"缺少: {', '.join(missing)}",
-                            severity="warning"
+                            details=f"缺少: {', '.join(sorted(missing))}",
+                            severity=severity
                         ))
 
                     # Check for extra boundaries
@@ -235,65 +275,135 @@ class CaseValidator:
                         self.results.append(ValidationResult(
                             passed=False,
                             message=f"{field_file.name} 有多余的边界定义",
-                            details=f"多余: {', '.join(extra)}",
+                            details=f"多余: {', '.join(sorted(extra))}",
                             severity="warning"
                         ))
 
                 except Exception:
                     pass
 
+    def _extract_named_block(self, content: str, block_name: str) -> Optional[str]:
+        """Extract body text of a named dictionary block."""
+        start_match = re.search(rf"\b{re.escape(block_name)}\b\s*\{{", content)
+        if not start_match:
+            return None
+
+        brace_start = content.find("{", start_match.start())
+        if brace_start < 0:
+            return None
+
+        depth = 0
+        for idx in range(brace_start, len(content)):
+            ch = content[idx]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return content[brace_start + 1 : idx]
+        return None
+
     def _get_mesh_boundaries(self) -> set:
-        """Extract boundary names from blockMeshDict."""
-        block_mesh = self.case_path / "system" / "blockMeshDict"
         boundaries = set()
 
-        if block_mesh.exists():
+        # Prefer runtime boundary file (most accurate after mesh generation).
+        poly_boundary = self.case_path / "constant" / "polyMesh" / "boundary"
+        if poly_boundary.exists():
             try:
-                content = block_mesh.read_text()
-                # Simple pattern to extract boundary names
-                in_boundary = False
-                brace_depth = 0
-                for line in content.split('\n'):
-                    if 'boundary' in line and '(' in line:
-                        in_boundary = True
-                        continue
-                    if in_boundary:
-                        if '{' in line:
-                            brace_depth += 1
-                        if '}' in line:
-                            brace_depth -= 1
-                        if brace_depth == 0 and ')' in line:
-                            break
-                        # Extract boundary name (word before {)
-                        match = re.match(r'\s*(\w+)\s*$', line)
-                        if match and brace_depth == 0:
-                            boundaries.add(match.group(1))
+                content = poly_boundary.read_text(encoding="utf-8", errors="replace")
+                start_match = re.search(r"^\s*\d+\s*$\s*\n\s*\(", content, flags=re.MULTILINE)
+                parse_region = content[start_match.end() :] if start_match else content
+                for match in re.finditer(
+                    r"^\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*$\s*\n\s*\{",
+                    parse_region,
+                    flags=re.MULTILINE,
+                ):
+                    boundaries.add(match.group(1))
             except Exception:
-                pass
+                boundaries = set()
 
+        if boundaries:
+            return boundaries
+
+        # Fallback: parse boundary section from system/blockMeshDict.
+        block_mesh = self.case_path / "system" / "blockMeshDict"
+        if not block_mesh.exists():
+            return boundaries
+
+        try:
+            content = block_mesh.read_text(encoding="utf-8", errors="replace")
+            boundary_keyword = re.search(r"\bboundary\b", content)
+            if not boundary_keyword:
+                return boundaries
+
+            list_start = content.find("(", boundary_keyword.end())
+            if list_start < 0:
+                return boundaries
+
+            depth = 0
+            list_end = -1
+            for idx in range(list_start, len(content)):
+                ch = content[idx]
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        list_end = idx
+                        break
+            if list_end < 0:
+                return boundaries
+
+            section = content[list_start + 1 : list_end]
+            for match in re.finditer(
+                r"^\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*$\s*\n\s*\{",
+                section,
+                flags=re.MULTILINE,
+            ):
+                boundaries.add(match.group(1))
+        except Exception:
+            pass
         return boundaries
 
     def _extract_boundaries_from_field(self, content: str) -> set:
         """Extract boundary names from a field file."""
         boundaries = set()
-        in_boundary_field = False
+        boundary_body = self._extract_named_block(content, "boundaryField")
+        if not boundary_body:
+            return boundaries
+
+        pending_name: Optional[str] = None
         brace_depth = 0
 
-        for line in content.split('\n'):
-            if 'boundaryField' in line:
-                in_boundary_field = True
+        for line in boundary_body.split('\n'):
+            # Strip inline comments.
+            line = line.split("//", 1)[0]
+            stripped = line.strip()
+            if not stripped:
                 continue
-            if in_boundary_field:
-                if '{' in line:
-                    brace_depth += line.count('{')
-                if '}' in line:
-                    brace_depth -= line.count('}')
-                if brace_depth <= 0 and '}' in line:
-                    break
-                # Extract boundary name
-                match = re.match(r'\s*(\w+)\s*$', line)
-                if match and brace_depth == 1:
-                    boundaries.add(match.group(1))
+
+            if brace_depth == 0:
+                inline_match = re.match(r'^([A-Za-z_][A-Za-z0-9_.-]*)\s*\{', stripped)
+                if inline_match:
+                    boundaries.add(inline_match.group(1))
+                    brace_depth += stripped.count("{") - stripped.count("}")
+                    pending_name = None
+                    continue
+
+                name_match = re.match(r'^([A-Za-z_][A-Za-z0-9_.-]*)\s*$', stripped)
+                if name_match:
+                    pending_name = name_match.group(1)
+                    continue
+
+                if pending_name and stripped.startswith("{"):
+                    boundaries.add(pending_name)
+                    pending_name = None
+                    brace_depth += stripped.count("{") - stripped.count("}")
+                    continue
+
+            brace_depth += stripped.count("{") - stripped.count("}")
+            if brace_depth < 0:
+                brace_depth = 0
 
         return boundaries
 
