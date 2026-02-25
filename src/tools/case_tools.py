@@ -55,6 +55,7 @@ _SAFE_BOUNDARY_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SAFE_BC_EXTRA_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SAFE_BC_EXTRA_VALUE_RE = re.compile(r"^[^\r\n{};]+$")
 _FLOAT_TOKEN_PATTERN = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+_FLOAT_TOKEN_STRICT_PATTERN = rf"{_FLOAT_TOKEN_PATTERN}(?![A-Za-z0-9_.+-])"
 
 
 def _truncate(text: str, limit: int = CHARACTER_LIMIT) -> str:
@@ -1540,7 +1541,7 @@ def openfoam_get_run_status(params: GetRunStatusInput) -> str:
             # Parse time
             # Keep this anchored to avoid matching "ExecutionTime = ..."
             time_match = re.search(
-                rf'^\s*Time\s*=\s*({_FLOAT_TOKEN_PATTERN})\b',
+                rf'^\s*Time\s*=\s*({_FLOAT_TOKEN_STRICT_PATTERN})',
                 line,
             )
             if time_match:
@@ -1556,7 +1557,7 @@ def openfoam_get_run_status(params: GetRunStatusInput) -> str:
 
             # Parse residuals
             residual_match = re.search(
-                rf'Solving for ([A-Za-z0-9_.-]+),.*?Final residual\s*=\s*({_FLOAT_TOKEN_PATTERN})\b',
+                rf'Solving for ([A-Za-z0-9_.-]+),.*?Final residual\s*=\s*({_FLOAT_TOKEN_STRICT_PATTERN})',
                 line
             )
             if residual_match:

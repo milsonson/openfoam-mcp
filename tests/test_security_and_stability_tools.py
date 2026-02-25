@@ -719,6 +719,7 @@ def test_get_run_status_tolerates_malformed_scientific_notation(tmp_path: Path) 
     assert "求解器运行状态" in result
     assert "**当前时间**: 0.001" in result
     assert "获取运行状态时发生错误" not in result
+    assert "## 最新残差" not in result
 
 
 def test_get_run_status_truncates_full_error_message(tmp_path: Path, monkeypatch):
