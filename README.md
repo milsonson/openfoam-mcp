@@ -144,41 +144,41 @@ python src/server.py
 
 ### 模板与案例
 
-- `openfoam_list_templates`
-- `openfoam_get_template_info`
-- `openfoam_create_case`
-- `openfoam_validate_case`
-- `openfoam_generate_mesh`
-- `openfoam_generate_boundary_conditions`
+- `openfoam_list_templates`：列出模板，可按类别过滤并切换输出格式。
+- `openfoam_get_template_info`：查看单个模板的参数定义、默认值和说明。
+- `openfoam_create_case`：按模板与参数创建案例目录并写入基础配置文件。
+- `openfoam_validate_case`：检查案例结构和关键字典是否完整可运行。
+- `openfoam_generate_mesh`：生成或更新网格配置（如 `blockMeshDict`）。
+- `openfoam_generate_boundary_conditions`：按工况生成 `0/` 目录边界条件文件。
 
 ### 执行与监控
 
-- `openfoam_run_solver`
-- `openfoam_run_parallel`
-- `openfoam_get_run_status`
-- `openfoam_generate_residual_plot`
+- `openfoam_run_solver`：串行运行求解器并记录执行结果。
+- `openfoam_run_parallel`：并行分解并运行求解器。
+- `openfoam_get_run_status`：读取日志与案例状态，汇总执行进度。
+- `openfoam_generate_residual_plot`：提取残差并输出曲线图/摘要。
 
 ### 知识与辅助计算
 
-- `openfoam_analyze_problem`
-- `openfoam_get_fluid_properties`
-- `openfoam_calculate_yplus`
-- `openfoam_search_tutorials`
-- `openfoam_read_tutorial_file`
+- `openfoam_analyze_problem`：将自然语言问题转成 CFD 建模建议。
+- `openfoam_get_fluid_properties`：查询常见流体物性参数。
+- `openfoam_calculate_yplus`：根据目标 `y+` 估算第一层网格高度。
+- `openfoam_search_tutorials`：按关键词搜索 OpenFOAM 官方教程。
+- `openfoam_read_tutorial_file`：读取官方教程中的具体文件内容。
 
 ### 字典与调试
 
-- `openfoam_get_patch_list`
-- `openfoam_read_dictionary`
-- `openfoam_update_dictionary`
+- `openfoam_get_patch_list`：获取案例网格边界（patch）列表。
+- `openfoam_read_dictionary`：读取指定 OpenFOAM 字典文本。
+- `openfoam_update_dictionary`：按键值更新指定字典内容。
 
 ### 稳定性与工作流
 
-- `openfoam_preflight_check`
-- `openfoam_assess_case_stability`
-- `openfoam_apply_stability_fixes`
-- `openfoam_generate_modeling_plan`
-- `openfoam_run_workflow_from_prompt`
+- `openfoam_preflight_check`：执行环境与案例预检并给出阻塞项。
+- `openfoam_assess_case_stability`：评估当前设置的数值稳定性风险。
+- `openfoam_apply_stability_fixes`：自动应用稳定性修复建议。
+- `openfoam_generate_modeling_plan`：从需求生成分步骤建模计划。
+- `openfoam_run_workflow_from_prompt`：从自然语言一键执行端到端工作流。
 
 ## 8. 模板清单（当前实现）
 

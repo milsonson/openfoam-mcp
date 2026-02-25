@@ -165,6 +165,7 @@ async def _run_tool(func, *args) -> str:
 
 @mcp.tool(
     name="openfoam_list_templates",
+    description="列出可用模板，可按 category 过滤并选择 markdown/json 输出格式。",
     annotations={
         "title": "列出 OpenFOAM 模板",
         "readOnlyHint": True,
@@ -179,6 +180,7 @@ async def list_templates_tool(params: ListTemplatesInput) -> str:
 
 @mcp.tool(
     name="openfoam_get_template_info",
+    description="获取指定模板的参数、默认值与生成文件说明。",
     annotations={
         "title": "获取模板详情",
         "readOnlyHint": True,
@@ -193,6 +195,7 @@ async def get_template_info_tool(params: GetTemplateInfoInput) -> str:
 
 @mcp.tool(
     name="openfoam_create_case",
+    description="按模板与参数在绝对路径创建案例目录，并生成基础 OpenFOAM 文件。",
     annotations={
         "title": "创建 OpenFOAM 案例",
         "readOnlyHint": False,
@@ -207,6 +210,7 @@ async def create_case_tool(params: CreateCaseInput) -> str:
 
 @mcp.tool(
     name="openfoam_validate_case",
+    description="检查案例目录结构与关键字典文件是否满足求解前要求。",
     annotations={
         "title": "验证 OpenFOAM 案例",
         "readOnlyHint": True,
@@ -221,6 +225,7 @@ async def validate_case_tool(params: ValidateCaseInput) -> str:
 
 @mcp.tool(
     name="openfoam_run_solver",
+    description="在案例目录串行运行求解器，可自动从 controlDict 推断 solver。",
     annotations={
         "title": "运行 OpenFOAM 求解器",
         "readOnlyHint": False,
@@ -235,6 +240,7 @@ async def run_solver_tool(params: RunSolverInput) -> str:
 
 @mcp.tool(
     name="openfoam_analyze_problem",
+    description="将自然语言 CFD 问题解析为推荐模板、边界条件和求解设置。",
     annotations={
         "title": "分析 CFD 问题",
         "readOnlyHint": True,
@@ -249,6 +255,7 @@ async def analyze_problem_tool(params: AnalyzeProblemInput) -> str:
 
 @mcp.tool(
     name="openfoam_get_fluid_properties",
+    description="返回常见流体物性参数，用于初始工况估算和量纲分析。",
     annotations={
         "title": "获取流体物性",
         "readOnlyHint": True,
@@ -265,6 +272,7 @@ async def get_fluid_properties_tool(fluid_name: str) -> str:
 
 @mcp.tool(
     name="openfoam_generate_mesh",
+    description="生成或更新 blockMesh/snappyHexMesh 等网格配置文件。",
     annotations={
         "title": "生成网格配置",
         "readOnlyHint": False,
@@ -279,6 +287,7 @@ async def generate_mesh_tool(params: GenerateMeshInput) -> str:
 
 @mcp.tool(
     name="openfoam_generate_boundary_conditions",
+    description="按输入工况生成 0/ 目录边界条件字典文件。",
     annotations={
         "title": "生成边界条件",
         "readOnlyHint": False,
@@ -293,6 +302,7 @@ async def generate_boundary_conditions_tool(params: GenerateBoundaryConditionsIn
 
 @mcp.tool(
     name="openfoam_get_run_status",
+    description="读取日志和案例状态，汇总求解进度、错误与关键指标。",
     annotations={
         "title": "获取运行状态",
         "readOnlyHint": True,
@@ -307,6 +317,7 @@ async def get_run_status_tool(params: GetRunStatusInput) -> str:
 
 @mcp.tool(
     name="openfoam_run_parallel",
+    description="使用 decomposePar 与并行求解命令执行案例并记录运行日志。",
     annotations={
         "title": "并行运行求解器",
         "readOnlyHint": False,
@@ -321,6 +332,7 @@ async def run_parallel_tool(params: RunParallelInput) -> str:
 
 @mcp.tool(
     name="openfoam_generate_residual_plot",
+    description="从求解日志提取残差并生成曲线图与统计摘要。",
     annotations={
         "title": "生成残差曲线图",
         "readOnlyHint": False,
@@ -335,6 +347,7 @@ async def generate_residual_plot_tool(params: GenerateResidualPlotInput) -> str:
 
 @mcp.tool(
     name="openfoam_calculate_yplus",
+    description="根据速度、粘度与目标 y+ 估算第一层网格高度。",
     annotations={
         "title": "计算 y+ 和第一层网格高度",
         "readOnlyHint": True,
@@ -349,6 +362,7 @@ async def calculate_yplus_tool(params: CalculateYplusInput) -> str:
 
 @mcp.tool(
     name="openfoam_search_tutorials",
+    description="在 OpenFOAM 官方教程库按关键词搜索匹配案例。",
     annotations={
         "title": "搜索 OpenFOAM 官方教程",
         "readOnlyHint": True,
@@ -363,6 +377,7 @@ async def search_tutorials_tool(params: SearchTutorialsInput) -> str:
 
 @mcp.tool(
     name="openfoam_read_tutorial_file",
+    description="安全读取官方教程中的指定文件内容。",
     annotations={
         "title": "读取官方教程文件",
         "readOnlyHint": True,
@@ -377,6 +392,7 @@ async def read_tutorial_file_tool(params: ReadTutorialFileInput) -> str:
 
 @mcp.tool(
     name="openfoam_get_patch_list",
+    description="解析 boundary 文件并返回 patch 名称、类型与数量统计。",
     annotations={
         "title": "获取边界列表",
         "readOnlyHint": True,
@@ -391,6 +407,7 @@ async def get_patch_list_tool(params: GetPatchListInput) -> str:
 
 @mcp.tool(
     name="openfoam_read_dictionary",
+    description="读取指定 OpenFOAM 字典文件并返回文本内容。",
     annotations={
         "title": "读取 OpenFOAM 字典",
         "readOnlyHint": True,
@@ -405,6 +422,7 @@ async def read_dictionary_tool(params: ReadDictionaryInput) -> str:
 
 @mcp.tool(
     name="openfoam_update_dictionary",
+    description="对指定字典执行键值更新并将变更写回磁盘。",
     annotations={
         "title": "更新 OpenFOAM 字典",
         "readOnlyHint": False,
@@ -419,6 +437,7 @@ async def update_dictionary_tool(params: UpdateDictionaryInput) -> str:
 
 @mcp.tool(
     name="openfoam_preflight_check",
+    description="执行环境与案例预检，并输出 ready/degraded/blocked 结论。",
     annotations={
         "title": "OpenFOAM 运行前检查",
         "readOnlyHint": True,
@@ -433,6 +452,7 @@ async def preflight_check_tool(params: PreflightCheckInput) -> str:
 
 @mcp.tool(
     name="openfoam_assess_case_stability",
+    description="基于数值设置评估稳定性风险并给出告警项。",
     annotations={
         "title": "评估案例数值稳定性",
         "readOnlyHint": True,
@@ -447,6 +467,7 @@ async def assess_case_stability_tool(params: AssessCaseStabilityInput) -> str:
 
 @mcp.tool(
     name="openfoam_apply_stability_fixes",
+    description="自动应用保守稳定性修复建议到关键求解配置文件。",
     annotations={
         "title": "自动修复稳定性设置",
         "readOnlyHint": False,
@@ -461,6 +482,7 @@ async def apply_stability_fixes_tool(params: ApplyStabilityFixesInput) -> str:
 
 @mcp.tool(
     name="openfoam_generate_modeling_plan",
+    description="从自然语言需求生成可执行建模步骤、参数补全和检查清单。",
     annotations={
         "title": "自然语言建模计划",
         "readOnlyHint": True,
@@ -475,6 +497,7 @@ async def generate_modeling_plan_tool(params: GenerateModelingPlanInput) -> str:
 
 @mcp.tool(
     name="openfoam_run_workflow_from_prompt",
+    description="从自然语言一键执行建模规划、建案、预检与求解全流程。",
     annotations={
         "title": "自然语言端到端建模",
         "readOnlyHint": False,
