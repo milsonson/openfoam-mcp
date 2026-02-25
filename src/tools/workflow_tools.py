@@ -8,9 +8,11 @@ from pathlib import Path
 import json
 import logging
 import re
+import secrets
 import shutil
 import uuid
 from typing import Any, Dict, List, Optional, TypedDict
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from typing_extensions import NotRequired
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -119,6 +121,7 @@ class WorkflowManifest(TypedDict, total=False):
 
     contract_version: str
     job_id: str
+    access_token: str
     portal_url: str
     delivery_url: str
     status: str
@@ -513,6 +516,30 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _append_query_token(url: str, token: str) -> str:
+    """Append/replace `token` query parameter in a URL."""
+    parsed = urlsplit(url)
+    query_pairs = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k != "token"]
+    query_pairs.append(("token", token))
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, urlencode(query_pairs), parsed.fragment)
+    )
+
+
+def _tokenize_artifact_urls(artifacts: List[Dict[str, Any]], token: str) -> List[Dict[str, Any]]:
+    """Attach job access token to artifact URLs."""
+    tokenized: List[Dict[str, Any]] = []
+    for item in artifacts:
+        if not isinstance(item, dict):
+            continue
+        copied = dict(item)
+        raw_url = copied.get("url")
+        if isinstance(raw_url, str) and raw_url:
+            copied["url"] = _append_query_token(raw_url, token)
+        tokenized.append(copied)
+    return tokenized
+
+
 def _resolve_workflow_case_path(case_path: Optional[str], job_id: str) -> str:
     """Return validated case path, auto-allocating one when user does not provide it."""
     if case_path is not None and case_path.strip():
@@ -530,6 +557,7 @@ def _resolve_workflow_case_path(case_path: Optional[str], job_id: str) -> str:
 def _build_and_collect_artifacts(
     *,
     job_id: str,
+    access_token: str,
     case_path: str,
     payload: Dict[str, Any],
     kpi_summary: KPISummary,
@@ -577,6 +605,7 @@ def _build_and_collect_artifacts(
     manifest = {
         "contract_version": "v1",
         "job_id": job_id,
+        "access_token": access_token,
         "status": payload.get("status"),
         "template_id": payload.get("template_id"),
         "template_name": payload.get("template_name"),
@@ -587,10 +616,10 @@ def _build_and_collect_artifacts(
         "quality_report": quality_report,
     }
     write_job_manifest(job_id, manifest)
-    artifacts = list_job_artifacts(job_id)
+    artifacts = _tokenize_artifact_urls(list_job_artifacts(job_id), access_token)
     manifest["artifacts"] = artifacts
     write_job_manifest(job_id, manifest)
-    return list_job_artifacts(job_id)
+    return artifacts
 
 
 def _build_modeling_plan(description: str) -> Dict[str, Any]:
@@ -855,13 +884,15 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
     """
     runtime_config = load_server_config()
     job_id = uuid.uuid4().hex
-    portal_url = f"{runtime_config.portal_base_url}/{job_id}"
+    access_token = secrets.token_urlsafe(24)
+    portal_url = _append_query_token(f"{runtime_config.portal_base_url}/{job_id}", access_token)
     resolved_case_path = _resolve_workflow_case_path(params.case_path, job_id)
     create_job_artifact_dir(job_id)
 
     manifest_state: WorkflowManifest = {
         "contract_version": "v1",
         "job_id": job_id,
+        "access_token": access_token,
         "portal_url": portal_url,
         "delivery_url": portal_url,
         "status": "running",
@@ -923,9 +954,13 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
     def _with_common_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
         payload["contract_version"] = "v1"
         payload["job_id"] = job_id
+        payload["access_token"] = access_token
         payload["portal_url"] = portal_url
         payload["delivery_url"] = portal_url
-        payload["manifest_url"] = build_artifact_url(f"{job_id}/manifest.json")
+        payload["manifest_url"] = _append_query_token(
+            build_artifact_url(f"{job_id}/manifest.json"),
+            access_token,
+        )
         return payload
 
     _emit_event(stage="planning", status="running", message="开始分析建模需求", progress=5)
@@ -1324,6 +1359,7 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
     )
     artifacts = _build_and_collect_artifacts(
         job_id=job_id,
+        access_token=access_token,
         case_path=resolved_case_path,
         payload=payload,
         kpi_summary=kpi_summary,
@@ -1344,7 +1380,7 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
         progress=100,
         data={"artifacts": len(artifacts)},
     )
-    payload["artifacts"] = list_job_artifacts(job_id)
+    payload["artifacts"] = _tokenize_artifact_urls(list_job_artifacts(job_id), access_token)
     manifest_state["artifacts"] = payload["artifacts"]
     write_job_manifest(job_id, manifest_state)
 

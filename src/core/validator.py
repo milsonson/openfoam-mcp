@@ -474,6 +474,17 @@ class CaseValidator:
                         t in ['zeroGradient', 'slip', 'symmetry', 'symmetryPlane', 'empty']
                         for t in bc_types.values()
                     )
+                    has_inlet = any(
+                        t in ['fixedValue', 'uniformFixedValue', 'flowRateInletVelocity',
+                              'turbulentInlet', 'mappedFixedValue']
+                        for t in bc_types.values()
+                    )
+                    has_moving_wall = any(
+                        t in ['movingWallVelocity', 'fixedValue']
+                        for t in bc_types.values()
+                    )
+
+                    velocity_check_passed = False
                     if all_zero_grad:
                         self.results.append(ValidationResult(
                             passed=False,
@@ -481,27 +492,17 @@ class CaseValidator:
                             details="所有边界都是 zeroGradient/slip 类型，没有入口或壁面条件",
                             severity="warning"
                         ))
-
-                    # Check for no inlet
-                    has_inlet = any(
-                        t in ['fixedValue', 'uniformFixedValue', 'flowRateInletVelocity',
-                              'turbulentInlet', 'mappedFixedValue']
-                        for t in bc_types.values()
-                    )
-                    if not has_inlet and not all_zero_grad:
-                        # Check if it's a lid-driven cavity (has movingWall)
-                        has_moving_wall = any(
-                            t in ['movingWallVelocity', 'fixedValue']
-                            for t in bc_types.values()
-                        )
-                        if not has_moving_wall:
-                            self.results.append(ValidationResult(
-                                passed=False,
-                                message="速度场缺少入口边界条件",
-                                details="建议至少有一个 fixedValue 或 flowRateInletVelocity 入口",
-                                severity="warning"
-                            ))
+                    elif not has_inlet and not has_moving_wall:
+                        self.results.append(ValidationResult(
+                            passed=False,
+                            message="速度场缺少入口边界条件",
+                            details="建议至少有一个 fixedValue 或 flowRateInletVelocity 入口",
+                            severity="warning"
+                        ))
                     else:
+                        velocity_check_passed = True
+
+                    if velocity_check_passed:
                         self.results.append(ValidationResult(
                             passed=True,
                             message="速度场边界条件检查通过"

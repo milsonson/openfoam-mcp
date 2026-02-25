@@ -32,10 +32,15 @@ def test_workflow_returns_portal_and_artifacts(monkeypatch, tmp_path: Path) -> N
     payload = json.loads(result)
 
     assert payload["job_id"]
+    assert payload["access_token"]
     assert payload["portal_url"].startswith("http://localhost:8080/portal/")
     assert payload["manifest_url"].startswith("http://localhost:8080/artifacts/")
+    assert "token=" in payload["portal_url"]
+    assert "token=" in payload["delivery_url"]
+    assert "token=" in payload["manifest_url"]
     assert isinstance(payload["artifacts"], list)
     assert len(payload["artifacts"]) >= 1
+    assert all("token=" in item["url"] for item in payload["artifacts"])
     assert "kpi_summary" in payload
     assert "quality_report" in payload
 

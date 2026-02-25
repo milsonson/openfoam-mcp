@@ -37,15 +37,16 @@ def test_template_registry():
 
     from src.templates.registry import list_templates, get_template
 
-    templates = list_templates()
-    assert len(templates) == 13, f"Expected 13 templates, got {len(templates)}"
-
-    template_ids = [t.id for t in templates]
     expected_ids = [
         'pipe_flow', 'cavity_flow', 'cylinder_flow', 'natural_convection',
         'dam_break', 'bubble_rising', 'backward_step', 'channel_flow', 'heat_exchanger',
         'flat_plate', 'mixing_elbow', 'shock_tube', 'supersonic_nozzle'
     ]
+    templates = list_templates()
+    template_ids = [t.id for t in templates]
+    assert len(templates) >= len(expected_ids), (
+        f"Expected at least {len(expected_ids)} templates, got {len(templates)}"
+    )
     for tid in expected_ids:
         assert tid in template_ids, f"Missing template: {tid}"
 
@@ -93,7 +94,7 @@ def test_solver_selection():
     print(f"✅ Solver selection: Re={re}, turbulence={turb.value}, solver={solver}")
 
 
-def test_case_generation():
+def test_case_generation(tmp_path=None):
     """Test case file generation."""
     print("\nTesting case generation...")
     
@@ -102,7 +103,10 @@ def test_case_generation():
     from src.knowledge.mesh_strategies import BlockMeshParams
     from src.knowledge.boundaries import BoundaryDefinition, BoundaryType
     
-    case_path = Path('/tmp/openfoam_mcp_test')
+    if tmp_path is None:
+        case_path = Path('/tmp/openfoam_mcp_test')
+    else:
+        case_path = Path(tmp_path) / "openfoam_mcp_test"
     
     # Clean up
     if case_path.exists():

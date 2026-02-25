@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 import logging
@@ -196,9 +197,21 @@ def read_job_event_lines(job_id: str, limit: int = 500) -> list[str]:
     if not event_path.exists():
         return []
 
-    lines = [line.strip() for line in event_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     if limit > 0:
-        return lines[-limit:]
+        recent: deque[str] = deque(maxlen=limit)
+        with event_path.open("r", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = raw.strip()
+                if line:
+                    recent.append(line)
+        return list(recent)
+
+    lines: list[str] = []
+    with event_path.open("r", encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            line = raw.strip()
+            if line:
+                lines.append(line)
     return lines
 
 
@@ -213,7 +226,10 @@ def load_job_manifest(job_id: str) -> dict[str, Any]:
     if not manifest_path.exists():
         raise FileNotFoundError("未找到 manifest.json")
     raw = manifest_path.read_text(encoding="utf-8")
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("manifest JSON 解析失败") from exc
     if not isinstance(data, dict):
         raise ValueError("manifest 格式非法")
     return data

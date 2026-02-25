@@ -18,6 +18,8 @@ from src.web.artifacts import (
     create_job_bundle,
     create_job_artifact_dir,
     list_job_artifacts,
+    load_job_manifest,
+    read_job_event_lines,
     safe_resolve_artifact_path,
     write_job_manifest,
 )
@@ -126,3 +128,34 @@ def test_append_job_event_wraps_oserror(monkeypatch, tmp_path) -> None:
 
     with pytest.raises(RuntimeError, match="写入作业事件失败"):
         append_job_event("job_event_fail", {"status": "running"})
+
+
+def test_read_job_event_lines_reads_tail_without_path_read_text(monkeypatch, tmp_path) -> None:
+    """Event replay tail read should not rely on full-file Path.read_text()."""
+    artifact_root = tmp_path / "artifacts"
+    monkeypatch.setenv("OPENFOAM_MCP_ARTIFACT_DIR", str(artifact_root))
+
+    job_dir = create_job_artifact_dir("job_tail")
+    event_path = job_dir / "events.ndjson"
+    lines = [f'{{"idx": {idx}}}' for idx in range(1200)]
+    event_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _fail_read_text(self, *args, **kwargs):
+        raise AssertionError("Path.read_text should not be used for event replay tail")
+
+    monkeypatch.setattr(Path, "read_text", _fail_read_text)
+
+    tail = read_job_event_lines("job_tail", limit=3)
+    assert tail == ['{"idx": 1197}', '{"idx": 1198}', '{"idx": 1199}']
+
+
+def test_load_job_manifest_reports_invalid_json_as_value_error(monkeypatch, tmp_path) -> None:
+    """Corrupted manifest JSON should raise a normalized ValueError."""
+    artifact_root = tmp_path / "artifacts"
+    monkeypatch.setenv("OPENFOAM_MCP_ARTIFACT_DIR", str(artifact_root))
+
+    job_dir = create_job_artifact_dir("job_bad_manifest")
+    (job_dir / "manifest.json").write_text("{bad json", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="manifest"):
+        load_job_manifest("job_bad_manifest")

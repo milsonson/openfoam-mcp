@@ -382,6 +382,24 @@ def test_generate_boundary_conditions_unknown_field_still_creates_file(tmp_path:
     assert "alphaWater" in out_file.read_text(encoding="utf-8")
 
 
+def test_generate_boundary_conditions_allows_alpha_dot_water_field_name(tmp_path: Path):
+    """Multiphase field names like alpha.water should be accepted."""
+    case_path = tmp_path / "case_alpha_dot"
+    case_path.mkdir(parents=True, exist_ok=True)
+
+    result = openfoam_generate_boundary_conditions(
+        GenerateBoundaryConditionsInput(
+            case_path=str(case_path),
+            field_name="alpha.water",
+            boundary_definitions={"inlet": {"type": "fixedValue", "value": 1}},
+        )
+    )
+
+    out_file = case_path / "0" / "alpha.water"
+    assert out_file.exists()
+    assert "边界条件文件已生成" in result
+
+
 def test_generate_boundary_conditions_rejects_scalar_vector_mismatch(tmp_path: Path):
     """Boundary generator should reject vector value for scalar field."""
     case_path = tmp_path / "case_bc_dim"
@@ -583,6 +601,40 @@ def test_generate_boundary_conditions_uses_atomic_write(tmp_path: Path, monkeypa
     )
     assert "边界条件文件已生成" in result
     assert called.get("path") == case_path / "0" / "U"
+
+
+def test_get_patch_list_supports_dot_and_hyphen_patch_names(tmp_path: Path):
+    """Patch parser should support common OpenFOAM names with '.' and '-'."""
+    case_path = tmp_path / "case_patch_name_tokens"
+    (case_path / "system").mkdir(parents=True, exist_ok=True)
+    (case_path / "system" / "blockMeshDict").write_text(
+        (
+            "boundary\n"
+            "(\n"
+            "    inlet-1\n"
+            "    {\n"
+            "        type patch;\n"
+            "        faces\n"
+            "        (\n"
+            "            (0 4 7 3)\n"
+            "        );\n"
+            "    }\n"
+            "    alpha.water\n"
+            "    {\n"
+            "        type wall;\n"
+            "        faces\n"
+            "        (\n"
+            "            (1 2 6 5)\n"
+            "        );\n"
+            "    }\n"
+            ");\n"
+        ),
+        encoding="utf-8",
+    )
+
+    result = openfoam_get_patch_list(GetPatchListInput(case_path=str(case_path)))
+    assert "- inlet-1" in result
+    assert "- alpha.water" in result
 
 
 def test_calculate_yplus_applies_truncation(monkeypatch):
@@ -1237,3 +1289,79 @@ def test_validator_compressible_case_does_not_require_transport_properties(tmp_p
         item for item in report.results if "constant/transportProperties" in item.message and not item.passed
     ]
     assert not missing_transport_errors
+
+
+def test_validator_does_not_report_velocity_pass_when_underconstrained(tmp_path: Path) -> None:
+    """Velocity BC check should not simultaneously warn under-constrained and report pass."""
+    case_path = tmp_path / "case_velocity_underconstrained"
+    (case_path / "0").mkdir(parents=True, exist_ok=True)
+    (case_path / "constant").mkdir(parents=True, exist_ok=True)
+    (case_path / "system").mkdir(parents=True, exist_ok=True)
+
+    (case_path / "system" / "controlDict").write_text("application simpleFoam;\n", encoding="utf-8")
+    (case_path / "system" / "fvSchemes").write_text("FoamFile{}\n", encoding="utf-8")
+    (case_path / "system" / "fvSolution").write_text("FoamFile{}\n", encoding="utf-8")
+    (case_path / "constant" / "transportProperties").write_text("FoamFile{}\n", encoding="utf-8")
+    (case_path / "system" / "blockMeshDict").write_text(
+        (
+            "FoamFile{}\n"
+            "boundary\n"
+            "(\n"
+            "  inlet\n"
+            "  {\n"
+            "    type patch;\n"
+            "    faces ((0 1 2 3));\n"
+            "  }\n"
+            "  outlet\n"
+            "  {\n"
+            "    type patch;\n"
+            "    faces ((4 5 6 7));\n"
+            "  }\n"
+            ");\n"
+        ),
+        encoding="utf-8",
+    )
+    (case_path / "0" / "U").write_text(
+        (
+            "FoamFile{}\n"
+            "boundaryField\n"
+            "{\n"
+            "  inlet\n"
+            "  {\n"
+            "    type zeroGradient;\n"
+            "  }\n"
+            "  outlet\n"
+            "  {\n"
+            "    type zeroGradient;\n"
+            "  }\n"
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+    (case_path / "0" / "p").write_text(
+        (
+            "FoamFile{}\n"
+            "boundaryField\n"
+            "{\n"
+            "  inlet\n"
+            "  {\n"
+            "    type zeroGradient;\n"
+            "  }\n"
+            "  outlet\n"
+            "  {\n"
+            "    type zeroGradient;\n"
+            "  }\n"
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    report = CaseValidator(str(case_path)).validate_all(run_openfoam_checks=False)
+    warning_items = [
+        item for item in report.results if item.message == "速度场边界条件可能欠约束" and not item.passed
+    ]
+    pass_items = [
+        item for item in report.results if item.message == "速度场边界条件检查通过" and item.passed
+    ]
+    assert warning_items
+    assert not pass_items

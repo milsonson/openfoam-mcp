@@ -183,6 +183,7 @@ def render_portal_html(manifest: dict[str, Any]) -> str:
   <script>
     let payload = {payload_json};
     const terminalStatuses = new Set(["completed", "completed_with_warnings", "partial_failed", "failed", "needs_input"]);
+    const accessToken = typeof payload.access_token === "string" ? payload.access_token : "";
     const summaryGrid = document.getElementById("summary-grid");
     const artifactBody = document.getElementById("artifact-body");
     const riskBox = document.getElementById("risk-box");
@@ -238,6 +239,19 @@ def render_portal_html(manifest: dict[str, Any]) -> str:
       return null;
     }}
 
+    function withToken(url) {{
+      if (!accessToken) return String(url);
+      try {{
+        const parsed = new URL(String(url), window.location.origin);
+        if (!parsed.searchParams.has("token")) {{
+          parsed.searchParams.set("token", accessToken);
+        }}
+        return parsed.href;
+      }} catch (_err) {{
+        return String(url);
+      }}
+    }}
+
     function renderArtifacts() {{
       artifactBody.replaceChildren();
       const artifacts = Array.isArray(payload.artifacts) ? payload.artifacts : [];
@@ -268,7 +282,7 @@ def render_portal_html(manifest: dict[str, Any]) -> str:
         row.appendChild(sizeCell);
 
         const actionCell = document.createElement("td");
-        const safeUrl = safeDownloadUrl(item.url);
+        const safeUrl = safeDownloadUrl(withToken(item.url));
         if (safeUrl) {{
           const link = document.createElement("a");
           link.className = "download";
@@ -338,7 +352,7 @@ def render_portal_html(manifest: dict[str, Any]) -> str:
 
     async function refreshStatus() {{
       if (!payload.job_id) return;
-      const resp = await fetch(`/jobs/${{encodeURIComponent(payload.job_id)}}/status`);
+      const resp = await fetch(withToken(`/jobs/${{encodeURIComponent(payload.job_id)}}/status`));
       if (!resp.ok) return;
       payload = await resp.json();
       renderAll();
@@ -346,7 +360,7 @@ def render_portal_html(manifest: dict[str, Any]) -> str:
 
     function startEventStream() {{
       if (!payload.job_id || typeof EventSource === "undefined") return false;
-      const es = new EventSource(`/jobs/${{encodeURIComponent(payload.job_id)}}/events`);
+      const es = new EventSource(withToken(`/jobs/${{encodeURIComponent(payload.job_id)}}/events`));
       es.onmessage = (event) => {{
         if (!event.data) return;
         try {{

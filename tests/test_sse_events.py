@@ -63,3 +63,35 @@ def test_job_status_and_events_replay(monkeypatch, tmp_path) -> None:
     assert "solver stage started" in events_resp.text
     assert "data:" in events_resp.text
 
+
+def test_job_events_require_token_when_manifest_contains_access_token(monkeypatch, tmp_path) -> None:
+    artifact_root = tmp_path / "artifacts"
+    monkeypatch.setenv("OPENFOAM_MCP_ARTIFACT_DIR", str(artifact_root))
+    monkeypatch.setenv("OPENFOAM_MCP_ARTIFACT_BASE_URL", "http://localhost:8080/artifacts")
+
+    create_job_artifact_dir("job_3")
+    write_job_manifest(
+        "job_3",
+        {
+            "status": "running",
+            "stage": "solver",
+            "access_token": "token-xyz",
+        },
+    )
+    append_job_event(
+        "job_3",
+        {
+            "job_id": "job_3",
+            "stage": "solver",
+            "status": "running",
+            "message": "solver stage started",
+            "timestamp": "2026-02-22T00:00:00+00:00",
+        },
+    )
+
+    client = _build_client()
+    assert client.get("/jobs/job_3/events?replay_only=true").status_code == 403
+
+    ok = client.get("/jobs/job_3/events?replay_only=true&token=token-xyz")
+    assert ok.status_code == 200
+    assert "solver stage started" in ok.text

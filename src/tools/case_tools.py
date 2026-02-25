@@ -50,7 +50,7 @@ from ..knowledge import (
 # Character limit for responses
 CHARACTER_LIMIT = 25000
 _SAFE_SOLVER_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*$")
-_SAFE_FIELD_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+_SAFE_FIELD_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.]*$")
 _SAFE_BOUNDARY_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SAFE_BC_EXTRA_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SAFE_BC_EXTRA_VALUE_RE = re.compile(r"^[^\r\n{};]+$")

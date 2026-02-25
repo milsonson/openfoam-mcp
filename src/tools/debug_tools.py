@@ -138,7 +138,7 @@ def openfoam_get_patch_list(params: GetPatchListInput) -> str:
                     inner_content = _extract_parenthesized_from_index(content, start)
                     if inner_content:
                         patch_matches = re.findall(
-                            r'^\s*([A-Za-z_]\w*)\s*\{',
+                            r'^\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\{',
                             inner_content,
                             re.MULTILINE,
                         )
@@ -154,7 +154,11 @@ def openfoam_get_patch_list(params: GetPatchListInput) -> str:
                 # Find boundary section using balanced parentheses
                 inner_content = _extract_parenthesized_section(content, "boundary")
                 if inner_content:
-                    patch_matches = re.findall(r'^\s*([A-Za-z_]\w*)\s*\{', inner_content, re.MULTILINE)
+                    patch_matches = re.findall(
+                        r'^\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\{',
+                        inner_content,
+                        re.MULTILINE,
+                    )
                     patches = patch_matches
         except Exception as e:
             return f"解析 blockMeshDict 时出错: {str(e)}"

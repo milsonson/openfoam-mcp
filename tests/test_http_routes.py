@@ -59,3 +59,31 @@ def test_artifact_and_portal_routes(monkeypatch, tmp_path) -> None:
 
     invalid_resp = client.get("/artifacts/../../etc/passwd")
     assert invalid_resp.status_code in {400, 404}
+
+
+def test_job_routes_require_token_when_manifest_contains_access_token(monkeypatch, tmp_path) -> None:
+    artifact_root = tmp_path / "artifacts"
+    monkeypatch.setenv("OPENFOAM_MCP_ARTIFACT_DIR", str(artifact_root))
+    monkeypatch.setenv("OPENFOAM_MCP_ARTIFACT_BASE_URL", "http://localhost:8080/artifacts")
+
+    job_dir = create_job_artifact_dir("job_sec")
+    write_job_manifest(
+        "job_sec",
+        {
+            "status": "completed",
+            "access_token": "token-123",
+        },
+    )
+    (job_dir / "sample.txt").write_text("hello", encoding="utf-8")
+
+    client = _build_client()
+
+    assert client.get("/portal/job_sec").status_code == 403
+    assert client.get("/jobs/job_sec/status").status_code == 403
+    assert client.get("/artifacts/job_sec/sample.txt").status_code == 403
+
+    assert client.get("/portal/job_sec?token=token-123").status_code == 200
+    assert client.get("/jobs/job_sec/status?token=token-123").status_code == 200
+    ok_artifact = client.get("/artifacts/job_sec/sample.txt?token=token-123")
+    assert ok_artifact.status_code == 200
+    assert ok_artifact.text == "hello"
