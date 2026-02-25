@@ -288,6 +288,9 @@ openfoam_preflight_check(profile="solver" 或 "parallel")
 - 检查 `mpirun` 是否可用
 - 检查 `decomposePar` / `reconstructPar` 是否可用
 - 使用 `openfoam_run_parallel` 时确认 `n_processors >= 2`
+- 若报错 `libmetisDecomp.so: cannot open shared object file`：
+  1. 确认容器启动时已加载 OpenFOAM `etc/bashrc`
+  2. 确认 `LD_LIBRARY_PATH` 包含 `${WM_PROJECT_DIR}/platforms/linux64GccDPInt32Opt/lib/dummy`
 
 ### Q3: 为什么 workflow 返回 `completed_with_warnings`
 
