@@ -128,6 +128,7 @@ class CaseValidator:
         # Syntax and structure checks (Priority 2)
         self._validate_directory_structure()
         self._validate_file_syntax()
+        self._validate_block_mesh_semantics()
         self._validate_boundary_consistency()
 
         # Physical reasonableness checks (Priority 3)
@@ -281,6 +282,127 @@ class CaseValidator:
 
                 except Exception:
                     pass
+
+    def _extract_block_mesh_boundary_section(self, content: str) -> Optional[str]:
+        """Extract `boundary (...)` section body from blockMeshDict."""
+        boundary_keyword = re.search(r"\bboundary\b", content)
+        if not boundary_keyword:
+            return None
+
+        list_start = content.find("(", boundary_keyword.end())
+        if list_start < 0:
+            return None
+
+        depth = 0
+        list_end = -1
+        for idx in range(list_start, len(content)):
+            ch = content[idx]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    list_end = idx
+                    break
+        if list_end < 0:
+            return None
+        return content[list_start + 1 : list_end]
+
+    def _iter_boundary_patch_blocks(self, section: str):
+        """Yield `(patch_name, patch_body)` tuples parsed from boundary section."""
+        idx = 0
+        length = len(section)
+        name_pattern = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\{", re.MULTILINE)
+
+        while idx < length:
+            match = name_pattern.search(section, idx)
+            if not match:
+                break
+
+            patch_name = match.group(1)
+            brace_start = section.find("{", match.start())
+            if brace_start < 0:
+                break
+
+            depth = 0
+            brace_end = -1
+            for cursor in range(brace_start, length):
+                ch = section[cursor]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        brace_end = cursor
+                        break
+
+            if brace_end < 0:
+                break
+
+            yield patch_name, section[brace_start + 1 : brace_end]
+            idx = brace_end + 1
+
+    def _extract_patch_entry(self, patch_body: str, key: str) -> Optional[str]:
+        """Extract top-level value of `key` from a boundary patch block."""
+        match = re.search(rf"^\s*{re.escape(key)}\s+([^;\n]+)\s*;", patch_body, re.MULTILINE)
+        if not match:
+            return None
+        return match.group(1).strip()
+
+    def _validate_block_mesh_semantics(self):
+        """Validate blockMesh-specific semantic constraints."""
+        block_mesh = self.case_path / "system" / "blockMeshDict"
+        if not block_mesh.exists():
+            return
+
+        try:
+            content = block_mesh.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return
+
+        section = self._extract_block_mesh_boundary_section(content)
+        if section is None:
+            self.results.append(ValidationResult(
+                passed=False,
+                message="system/blockMeshDict 缺少 boundary 定义",
+                severity="error",
+            ))
+            return
+
+        cyclic_pairs: Dict[str, str] = {}
+        for patch_name, patch_body in self._iter_boundary_patch_blocks(section):
+            patch_type = (self._extract_patch_entry(patch_body, "type") or "").lower()
+            if patch_type != "cyclic":
+                continue
+
+            neighbour = self._extract_patch_entry(patch_body, "neighbourPatch")
+            if not neighbour:
+                self.results.append(ValidationResult(
+                    passed=False,
+                    message=f"blockMesh cyclic patch `{patch_name}` 缺少 neighbourPatch",
+                    details="cyclic 边界必须显式指定配对 patch 名称",
+                    severity="error",
+                ))
+                continue
+            cyclic_pairs[patch_name] = neighbour
+
+        for patch_name, neighbour in cyclic_pairs.items():
+            neighbour_target = cyclic_pairs.get(neighbour)
+            if neighbour_target is None:
+                self.results.append(ValidationResult(
+                    passed=False,
+                    message=f"blockMesh cyclic patch `{patch_name}` 的 neighbourPatch 无效",
+                    details=f"`{neighbour}` 不是 cyclic patch 或未定义",
+                    severity="error",
+                ))
+                continue
+            if neighbour_target != patch_name:
+                self.results.append(ValidationResult(
+                    passed=False,
+                    message=f"blockMesh cyclic patch `{patch_name}` 配对不对称",
+                    details=f"`{patch_name}` -> `{neighbour}`，但 `{neighbour}` -> `{neighbour_target}`",
+                    severity="error",
+                ))
 
     def _extract_named_block(self, content: str, block_name: str) -> Optional[str]:
         """Extract body text of a named dictionary block."""

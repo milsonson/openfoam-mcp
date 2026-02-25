@@ -54,6 +54,7 @@ _SAFE_FIELD_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.]*$")
 _SAFE_BOUNDARY_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SAFE_BC_EXTRA_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SAFE_BC_EXTRA_VALUE_RE = re.compile(r"^[^\r\n{};]+$")
+_FLOAT_TOKEN_PATTERN = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 
 
 def _truncate(text: str, limit: int = CHARACTER_LIMIT) -> str:
@@ -875,6 +876,7 @@ def openfoam_create_case(params: CreateCaseInput) -> str:
             result_lines.append(f"- ... 共 {len(created_files)} 个文件")
 
         # Run mesh generation if requested
+        mesh_failed = False
         if params.run_mesh:
             result_lines.append("")
             result_lines.append("## 网格生成")
@@ -889,8 +891,10 @@ def openfoam_create_case(params: CreateCaseInput) -> str:
                 if check_result.status == RunStatus.COMPLETED:
                     result_lines.append("✅ checkMesh 验证通过")
                 else:
+                    mesh_failed = True
                     result_lines.append(f"⚠️ checkMesh: {check_result.error_message or '未知问题'}")
             else:
+                mesh_failed = True
                 result_lines.append(f"❌ blockMesh 失败: {mesh_result.error_message}")
 
         # Run validation if requested
@@ -900,8 +904,10 @@ def openfoam_create_case(params: CreateCaseInput) -> str:
 
             report = validate_case(params.case_path, run_openfoam=False)
 
-            if report.passed:
+            if report.passed and not mesh_failed:
                 result_lines.append("✅ 所有验证检查通过")
+            elif report.passed and mesh_failed:
+                result_lines.append("⚠️ 文件级验证通过，但网格阶段失败，当前案例不可直接求解")
             else:
                 for r in report.results:
                     if not r.passed:
@@ -1533,9 +1539,15 @@ def openfoam_get_run_status(params: GetRunStatusInput) -> str:
         for line in recent_lines:
             # Parse time
             # Keep this anchored to avoid matching "ExecutionTime = ..."
-            time_match = re.search(r'^\s*Time\s*=\s*([\d.e+-]+)\b', line)
+            time_match = re.search(
+                rf'^\s*Time\s*=\s*({_FLOAT_TOKEN_PATTERN})\b',
+                line,
+            )
             if time_match:
-                status_info["current_time"] = float(time_match.group(1))
+                try:
+                    status_info["current_time"] = float(time_match.group(1))
+                except ValueError:
+                    pass
 
             # Parse iteration
             iter_match = re.search(r'Iteration\s*(\d+)', line, re.IGNORECASE)
@@ -1544,15 +1556,19 @@ def openfoam_get_run_status(params: GetRunStatusInput) -> str:
 
             # Parse residuals
             residual_match = re.search(
-                r'Solving for (\w+),.*?Final residual\s*=\s*([\d.e+-]+)',
+                rf'Solving for ([A-Za-z0-9_.-]+),.*?Final residual\s*=\s*({_FLOAT_TOKEN_PATTERN})\b',
                 line
             )
             if residual_match:
                 field = residual_match.group(1)
-                residual = float(residual_match.group(2))
-                if field not in status_info["residuals"]:
-                    status_info["residuals"][field] = []
-                status_info["residuals"][field].append(residual)
+                try:
+                    residual = float(residual_match.group(2))
+                except ValueError:
+                    residual = None
+                if residual is not None:
+                    if field not in status_info["residuals"]:
+                        status_info["residuals"][field] = []
+                    status_info["residuals"][field].append(residual)
 
             # Check for errors (keep conservative patterns to reduce false positives)
             stripped = line.strip()

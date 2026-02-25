@@ -152,3 +152,34 @@ def test_shock_tube_case_uses_internal_energy_and_pimple_block(tmp_path: Path) -
     fv_solution = (case_path / "system" / "fvSolution").read_text(encoding="utf-8")
     assert "energy          sensibleInternalEnergy;" in thermo
     assert "PIMPLE" in fv_solution
+    assert "rhoFinal" in fv_solution
+
+
+def test_create_case_does_not_claim_full_validation_success_when_mesh_failed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Validation output should not claim full success if blockMesh/checkMesh failed."""
+    case_path = tmp_path / "mesh_failed_case"
+
+    def fake_mesh_fail(*_args, **_kwargs):
+        return SimpleNamespace(status="failed", error_message="mock blockMesh failure")
+
+    fake_report = SimpleNamespace(passed=True, results=[])
+
+    monkeypatch.setattr("src.tools.case_tools.run_mesh_generation", fake_mesh_fail)
+    monkeypatch.setattr("src.tools.case_tools.validate_case", lambda *_args, **_kwargs: fake_report)
+
+    result = openfoam_create_case(
+        CreateCaseInput(
+            template_id="pipe_flow",
+            case_path=str(case_path),
+            parameters=_pipe_flow_params(),
+            run_mesh=True,
+            run_validation=True,
+        )
+    )
+
+    assert "❌ blockMesh 失败" in result
+    assert "✅ 所有验证检查通过" not in result
+    assert "网格阶段失败" in result

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -124,11 +125,19 @@ def test_channel_flow_block_mesh_preserves_neighbor_patch(tmp_path: Path) -> Non
         },
         case_path=str(case_path),
     )
-    block_mesh = OpenFOAMGenerator(config).generate_all()["system/blockMeshDict"]
+    files = OpenFOAMGenerator(config).generate_all()
+    block_mesh = files["system/blockMeshDict"]
+    u_field = files["0/U"]
 
     assert "type cyclic;" in block_mesh
     assert "neighbourPatch outlet;" in block_mesh
     assert "neighbourPatch inlet;" in block_mesh
+    assert "neighbourPatch back;" in block_mesh
+    assert "neighbourPatch front;" in block_mesh
+    assert re.search(r"\binlet\s*\{[^}]*type\s+cyclic;", u_field, re.DOTALL)
+    assert re.search(r"\boutlet\s*\{[^}]*type\s+cyclic;", u_field, re.DOTALL)
+    assert re.search(r"\bfront\s*\{[^}]*type\s+cyclic;", u_field, re.DOTALL)
+    assert re.search(r"\bback\s*\{[^}]*type\s+cyclic;", u_field, re.DOTALL)
 
 
 def test_laminar_control_dict_omits_turbulence_residual_fields(tmp_path: Path) -> None:

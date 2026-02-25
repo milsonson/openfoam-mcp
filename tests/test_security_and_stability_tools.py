@@ -701,6 +701,26 @@ def test_get_run_status_prefers_simulation_time_over_execution_time(tmp_path: Pa
     assert "**当前时间**: 8.68" not in result
 
 
+def test_get_run_status_tolerates_malformed_scientific_notation(tmp_path: Path) -> None:
+    """Status parser should ignore malformed residual tokens like `1.23e-`."""
+    case_path = tmp_path / "status_case_malformed_float"
+    case_path.mkdir(parents=True, exist_ok=True)
+    log_file = case_path / "log.simpleFoam"
+    log_file.write_text(
+        (
+            "Time = 0.001\n"
+            "Solving for p, Initial residual = 0.1, Final residual = 1.1236e-, No Iterations 1\n"
+            "End\n"
+        ),
+        encoding="utf-8",
+    )
+
+    result = openfoam_get_run_status(GetRunStatusInput(case_path=str(case_path)))
+    assert "求解器运行状态" in result
+    assert "**当前时间**: 0.001" in result
+    assert "获取运行状态时发生错误" not in result
+
+
 def test_get_run_status_truncates_full_error_message(tmp_path: Path, monkeypatch):
     """Error fallback should pass the full message into _truncate."""
     case_path = tmp_path / "status_case_err"
@@ -1038,6 +1058,36 @@ def test_preflight_parallel_detects_metis_runtime_library_issue(monkeypatch) -> 
     assert "libmetisDecomp.so" in decompose.get("detail", "")
 
 
+def test_preflight_detects_cyclic_patch_without_neighbour_patch(tmp_path: Path) -> None:
+    """Preflight should block cases with cyclic patch definitions missing neighbourPatch."""
+    case_path = tmp_path / "case_cyclic_missing_neighbor"
+    _create_min_case(case_path)
+    (case_path / "system" / "blockMeshDict").write_text(
+        (
+            "FoamFile{}\n"
+            "boundary\n"
+            "(\n"
+            "front\n"
+            "{\n"
+            "    type cyclic;\n"
+            "    faces ((0 1 2 3));\n"
+            "}\n"
+            ")\n"
+        ),
+        encoding="utf-8",
+    )
+
+    result = openfoam_preflight_check(
+        PreflightCheckInput(case_path=str(case_path), response_format="json")
+    )
+    payload = json.loads(result)
+    assert payload["summary"]["overall"] == "blocked"
+    assert any(
+        check["severity"] == "error" and "neighbourPatch" in check["message"]
+        for check in payload["geometry_checks"]
+    )
+
+
 def test_preflight_input_rejects_invalid_solver_name() -> None:
     """Preflight solver must be validated as a safe command token."""
     with pytest.raises(ValueError, match="非法求解器名称"):
@@ -1267,6 +1317,50 @@ def test_validator_flags_missing_required_patch_entries_as_error(tmp_path: Path)
         item for item in report.results if "U 缺少边界定义" in item.message and item.severity == "error"
     ]
     assert missing_patch_errors
+
+
+def test_validator_flags_cyclic_patch_without_neighbour_patch(tmp_path: Path) -> None:
+    """Validator should reject cyclic patches missing neighbourPatch in blockMeshDict."""
+    case_path = tmp_path / "case_cyclic_semantic"
+    (case_path / "0").mkdir(parents=True, exist_ok=True)
+    (case_path / "constant").mkdir(parents=True, exist_ok=True)
+    (case_path / "system").mkdir(parents=True, exist_ok=True)
+
+    (case_path / "system" / "controlDict").write_text("application simpleFoam;\n", encoding="utf-8")
+    (case_path / "system" / "fvSchemes").write_text("FoamFile{}\n", encoding="utf-8")
+    (case_path / "system" / "fvSolution").write_text("FoamFile{}\n", encoding="utf-8")
+    (case_path / "constant" / "transportProperties").write_text(
+        "FoamFile{}\nnu [0 2 -1 0 0 0 0] 1e-06;\n",
+        encoding="utf-8",
+    )
+    (case_path / "system" / "blockMeshDict").write_text(
+        (
+            "FoamFile{}\n"
+            "boundary\n"
+            "(\n"
+            "front\n"
+            "{\n"
+            "    type cyclic;\n"
+            "    faces ((0 1 2 3));\n"
+            "}\n"
+            ")\n"
+        ),
+        encoding="utf-8",
+    )
+    (case_path / "0" / "U").write_text(
+        "FoamFile{}\nboundaryField\n{\n    front { type cyclic; }\n}\n",
+        encoding="utf-8",
+    )
+    (case_path / "0" / "p").write_text(
+        "FoamFile{}\nboundaryField\n{\n    front { type cyclic; }\n}\n",
+        encoding="utf-8",
+    )
+
+    report = CaseValidator(str(case_path)).validate_all(run_openfoam_checks=False)
+    assert any(
+        item.severity == "error" and "缺少 neighbourPatch" in item.message
+        for item in report.results
+    )
 
 
 def test_validator_compressible_case_does_not_require_transport_properties(tmp_path: Path) -> None:

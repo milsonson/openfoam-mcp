@@ -314,6 +314,8 @@ boundaryField
                     content += f"        value           uniform ({lid_vel} 0 0);\n"
                 else:
                     content += f"        type            noSlip;\n"
+            elif boundary.physical_type == BoundaryType.CYCLIC:
+                content += f"        type            cyclic;\n"
             elif boundary.physical_type == BoundaryType.SYMMETRY:
                 content += f"        type            symmetry;\n"
             elif boundary.physical_type == BoundaryType.EMPTY:
@@ -355,6 +357,8 @@ boundaryField
                 content += f"        value           uniform 0;\n"
             elif boundary.physical_type == BoundaryType.WALL:
                 content += f"        type            zeroGradient;\n"
+            elif boundary.physical_type == BoundaryType.CYCLIC:
+                content += f"        type            cyclic;\n"
             elif boundary.physical_type == BoundaryType.SYMMETRY:
                 content += f"        type            symmetry;\n"
             elif boundary.physical_type == BoundaryType.EMPTY:
@@ -395,6 +399,8 @@ boundaryField
             elif boundary.physical_type == BoundaryType.WALL:
                 content += f"        type            kqRWallFunction;\n"
                 content += f"        value           uniform {k_init:.6f};\n"
+            elif boundary.physical_type == BoundaryType.CYCLIC:
+                content += f"        type            cyclic;\n"
             elif boundary.physical_type == BoundaryType.SYMMETRY:
                 content += f"        type            symmetry;\n"
             elif boundary.physical_type == BoundaryType.EMPTY:
@@ -435,6 +441,8 @@ boundaryField
             elif boundary.physical_type == BoundaryType.WALL:
                 content += f"        type            epsilonWallFunction;\n"
                 content += f"        value           uniform {epsilon_init:.6f};\n"
+            elif boundary.physical_type == BoundaryType.CYCLIC:
+                content += f"        type            cyclic;\n"
             elif boundary.physical_type == BoundaryType.SYMMETRY:
                 content += f"        type            symmetry;\n"
             elif boundary.physical_type == BoundaryType.EMPTY:
@@ -475,6 +483,8 @@ boundaryField
             elif boundary.physical_type == BoundaryType.WALL:
                 content += f"        type            omegaWallFunction;\n"
                 content += f"        value           uniform {omega_init:.6f};\n"
+            elif boundary.physical_type == BoundaryType.CYCLIC:
+                content += f"        type            cyclic;\n"
             elif boundary.physical_type == BoundaryType.SYMMETRY:
                 content += f"        type            symmetry;\n"
             elif boundary.physical_type == BoundaryType.EMPTY:
@@ -506,6 +516,8 @@ boundaryField
             if boundary.physical_type == BoundaryType.WALL:
                 content += f"        type            nutkWallFunction;\n"
                 content += f"        value           uniform 0;\n"
+            elif boundary.physical_type == BoundaryType.CYCLIC:
+                content += f"        type            cyclic;\n"
             elif boundary.physical_type == BoundaryType.EMPTY:
                 content += f"        type            empty;\n"
             elif boundary.physical_type == BoundaryType.SYMMETRY:
@@ -555,6 +567,8 @@ boundaryField
                 content += f"        value           uniform {cold_temp};\n"
             elif boundary.physical_type == BoundaryType.WALL:
                 content += f"        type            zeroGradient;\n"
+            elif boundary.physical_type == BoundaryType.CYCLIC:
+                content += f"        type            cyclic;\n"
             elif boundary.physical_type == BoundaryType.EMPTY:
                 content += f"        type            empty;\n"
             else:
@@ -607,6 +621,8 @@ boundaryField
                 content += f"        value           uniform {p_outlet};\n"
             elif boundary.physical_type == BoundaryType.WALL:
                 content += f"        type            zeroGradient;\n"
+            elif boundary.physical_type == BoundaryType.CYCLIC:
+                content += f"        type            cyclic;\n"
             elif boundary.physical_type == BoundaryType.SYMMETRY:
                 content += f"        type            symmetry;\n"
             elif boundary.physical_type == BoundaryType.EMPTY:
@@ -663,6 +679,8 @@ boundaryField
                     content += f"        value           uniform {wall_temp_value};\n"
                 else:
                     content += f"        type            zeroGradient;\n"
+            elif boundary.physical_type == BoundaryType.CYCLIC:
+                content += f"        type            cyclic;\n"
             elif boundary.physical_type == BoundaryType.SYMMETRY:
                 content += f"        type            symmetry;\n"
             elif boundary.physical_type == BoundaryType.EMPTY:
@@ -702,6 +720,8 @@ boundaryField
             elif boundary.physical_type == BoundaryType.WALL:
                 content += f"        type            fixedFluxPressure;\n"
                 content += f"        value           uniform 0;\n"
+            elif boundary.physical_type == BoundaryType.CYCLIC:
+                content += f"        type            cyclic;\n"
             elif boundary.physical_type == BoundaryType.SYMMETRY:
                 content += f"        type            symmetry;\n"
             elif boundary.physical_type == BoundaryType.EMPTY:
@@ -740,6 +760,8 @@ boundaryField
                 content += f"        value           uniform 0;\n"
             elif boundary.physical_type == BoundaryType.WALL:
                 content += f"        type            zeroGradient;\n"
+            elif boundary.physical_type == BoundaryType.CYCLIC:
+                content += f"        type            cyclic;\n"
             elif boundary.physical_type == BoundaryType.SYMMETRY:
                 content += f"        type            symmetry;\n"
             elif boundary.physical_type == BoundaryType.EMPTY:
@@ -780,6 +802,8 @@ boundaryField
             elif boundary.physical_type == BoundaryType.WALL:
                 content += f"        type            fixedFluxPressure;\n"
                 content += f"        value           uniform 0;\n"
+            elif boundary.physical_type == BoundaryType.CYCLIC:
+                content += f"        type            cyclic;\n"
             elif boundary.physical_type == BoundaryType.SYMMETRY:
                 content += f"        type            symmetry;\n"
             elif boundary.physical_type == BoundaryType.EMPTY:
@@ -1690,9 +1714,35 @@ relaxationFactors
             content += f'''
 solvers
 {{
-    "(rho|rhoU|rhoE)"
+    rho
     {{
         solver          diagonal;
+    }}
+
+    rhoU
+    {{
+        $rho;
+    }}
+
+    rhoE
+    {{
+        $rho;
+    }}
+
+    // Some distributions query *Final entries explicitly.
+    rhoFinal
+    {{
+        $rho;
+    }}
+
+    rhoUFinal
+    {{
+        $rho;
+    }}
+
+    rhoEFinal
+    {{
+        $rho;
     }}
 
     U
@@ -1708,6 +1758,12 @@ solvers
     {{
         $U;
         tolerance       1e-10;
+        relTol          0;
+    }}
+
+    eFinal
+    {{
+        $e;
         relTol          0;
     }}
 }}
@@ -2448,11 +2504,12 @@ def _create_boundaries_for_template(template_id: str, params: Dict[str, Any]) ->
         ]
     elif template_id == "channel_flow":
         return [
-            BoundaryDefinition("inlet", BoundaryType.INLET, "cyclic"),
-            BoundaryDefinition("outlet", BoundaryType.OUTLET, "cyclic"),
+            BoundaryDefinition("inlet", BoundaryType.CYCLIC, "default"),
+            BoundaryDefinition("outlet", BoundaryType.CYCLIC, "default"),
             BoundaryDefinition("topWall", BoundaryType.WALL, "no_slip"),
             BoundaryDefinition("bottomWall", BoundaryType.WALL, "no_slip"),
-            BoundaryDefinition("frontAndBack", BoundaryType.EMPTY),
+            BoundaryDefinition("front", BoundaryType.CYCLIC, "default"),
+            BoundaryDefinition("back", BoundaryType.CYCLIC, "default"),
         ]
     elif template_id == "heat_exchanger":
         return [
@@ -2727,7 +2784,8 @@ def _create_mesh_for_template(template_id: str, params: Dict[str, Any]) -> Block
             "outlet": {"type": "cyclic", "faces": ["x_max"], "neighbourPatch": "inlet"},
             "topWall": {"type": "wall", "faces": ["y_max"]},
             "bottomWall": {"type": "wall", "faces": ["y_min"]},
-            "frontAndBack": {"type": "cyclic", "faces": ["z_min", "z_max"]},
+            "front": {"type": "cyclic", "faces": ["z_min"], "neighbourPatch": "back"},
+            "back": {"type": "cyclic", "faces": ["z_max"], "neighbourPatch": "front"},
         }
         return mesh
 

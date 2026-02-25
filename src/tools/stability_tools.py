@@ -265,6 +265,141 @@ def _collect_solver_compatibility_checks(
     return checks
 
 
+def _extract_boundary_section(block_mesh_content: str) -> Optional[str]:
+    """Extract boundary list body from blockMeshDict."""
+    boundary_keyword = re.search(r"\bboundary\b", block_mesh_content)
+    if not boundary_keyword:
+        return None
+
+    list_start = block_mesh_content.find("(", boundary_keyword.end())
+    if list_start < 0:
+        return None
+
+    depth = 0
+    list_end = -1
+    for idx in range(list_start, len(block_mesh_content)):
+        ch = block_mesh_content[idx]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                list_end = idx
+                break
+    if list_end < 0:
+        return None
+    return block_mesh_content[list_start + 1 : list_end]
+
+
+def _iter_patch_blocks(boundary_section: str):
+    """Yield `(name, body)` tuples for each patch in blockMesh boundary section."""
+    idx = 0
+    length = len(boundary_section)
+    name_pattern = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\{", re.MULTILINE)
+
+    while idx < length:
+        match = name_pattern.search(boundary_section, idx)
+        if not match:
+            break
+
+        patch_name = match.group(1)
+        brace_start = boundary_section.find("{", match.start())
+        if brace_start < 0:
+            break
+
+        depth = 0
+        brace_end = -1
+        for cursor in range(brace_start, length):
+            ch = boundary_section[cursor]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    brace_end = cursor
+                    break
+
+        if brace_end < 0:
+            break
+
+        yield patch_name, boundary_section[brace_start + 1 : brace_end]
+        idx = brace_end + 1
+
+
+def _extract_patch_value(patch_body: str, key: str) -> Optional[str]:
+    """Extract a single entry value from patch block."""
+    match = re.search(rf"^\s*{re.escape(key)}\s+([^;\n]+)\s*;", patch_body, re.MULTILINE)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _collect_block_mesh_semantic_checks(case_path: Path) -> List[Dict[str, str]]:
+    """Collect semantic checks for blockMesh cyclic patch pairing."""
+    checks: List[Dict[str, str]] = []
+    block_mesh = case_path / "system" / "blockMeshDict"
+    if not block_mesh.exists():
+        return checks
+
+    try:
+        content = block_mesh.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return checks
+
+    section = _extract_boundary_section(content)
+    if section is None:
+        checks.append(
+            {
+                "severity": "error",
+                "title": "blockMesh 边界定义",
+                "message": "system/blockMeshDict 缺少 boundary(...) 段，无法生成网格。",
+                "suggestion": "补全 blockMeshDict 的 boundary 列表并重新运行 blockMesh。",
+            }
+        )
+        return checks
+
+    cyclic_pairs: Dict[str, str] = {}
+    for patch_name, patch_body in _iter_patch_blocks(section):
+        patch_type = (_extract_patch_value(patch_body, "type") or "").lower()
+        if patch_type != "cyclic":
+            continue
+        neighbour = _extract_patch_value(patch_body, "neighbourPatch")
+        if not neighbour:
+            checks.append(
+                {
+                    "severity": "error",
+                    "title": f"blockMesh cyclic patch `{patch_name}`",
+                    "message": "缺少 neighbourPatch，blockMesh 会在构建 cyclic 边界时报错。",
+                    "suggestion": f"为 `{patch_name}` 添加 `neighbourPatch` 并保证配对对称。",
+                }
+            )
+            continue
+        cyclic_pairs[patch_name] = neighbour
+
+    for patch_name, neighbour in cyclic_pairs.items():
+        neighbour_target = cyclic_pairs.get(neighbour)
+        if neighbour_target is None:
+            checks.append(
+                {
+                    "severity": "error",
+                    "title": f"blockMesh cyclic patch `{patch_name}`",
+                    "message": f"`neighbourPatch {neighbour}` 未定义为 cyclic patch。",
+                    "suggestion": "检查 cyclic patch 命名并确保两端都设置 `type cyclic`。",
+                }
+            )
+        elif neighbour_target != patch_name:
+            checks.append(
+                {
+                    "severity": "error",
+                    "title": f"blockMesh cyclic patch `{patch_name}`",
+                    "message": f"配对不对称：`{patch_name} -> {neighbour}`，`{neighbour} -> {neighbour_target}`。",
+                    "suggestion": "将两个 patch 的 neighbourPatch 互相指向对方。",
+                }
+            )
+
+    return checks
+
+
 def _add_check(
     checks: List[Dict[str, str]],
     severity: str,
@@ -471,6 +606,9 @@ def openfoam_preflight_check(params: PreflightCheckInput) -> str:
                     }
                 )
     compatibility_checks = _collect_solver_compatibility_checks(solver, control_text, case_path_obj)
+    geometry_checks: List[Dict[str, str]] = []
+    if case_path_obj is not None and case_path_obj.exists() and case_path_obj.is_dir():
+        geometry_checks = _collect_block_mesh_semantic_checks(case_path_obj)
 
     # Aggregate counts
     for item in env_checks:
@@ -512,6 +650,14 @@ def openfoam_preflight_check(params: PreflightCheckInput) -> str:
             item["message"],
             suggestion=item.get("suggestion"),
         )
+    for item in geometry_checks:
+        _add_check(
+            checks,
+            item["severity"],
+            item["title"],
+            item["message"],
+            suggestion=item.get("suggestion"),
+        )
 
     errors = sum(1 for c in checks if c["severity"] == "error")
     warnings = sum(1 for c in checks if c["severity"] == "warning")
@@ -537,6 +683,7 @@ def openfoam_preflight_check(params: PreflightCheckInput) -> str:
         "command_checks": command_checks,
         "case_checks": case_checks,
         "compatibility_checks": compatibility_checks,
+        "geometry_checks": geometry_checks,
         "checks": checks,
     }
 
@@ -580,6 +727,15 @@ def openfoam_preflight_check(params: PreflightCheckInput) -> str:
         lines.append("")
         lines.append("## 兼容性检查")
         for item in compatibility_checks:
+            icon = "✅" if item["severity"] == "ok" else ("❌" if item["severity"] == "error" else "⚠️")
+            lines.append(f"- {icon} **{item['title']}**: {item['message']}")
+            if item.get("suggestion"):
+                lines.append(f"  建议: {item['suggestion']}")
+
+    if geometry_checks:
+        lines.append("")
+        lines.append("## 几何与网格语义检查")
+        for item in geometry_checks:
             icon = "✅" if item["severity"] == "ok" else ("❌" if item["severity"] == "error" else "⚠️")
             lines.append(f"- {icon} **{item['title']}**: {item['message']}")
             if item.get("suggestion"):
