@@ -1049,6 +1049,16 @@ OPENFOAM_ERROR_PATTERNS = {
         "suggestion": "检查入口湍流参数和初始场",
         "severity": "warning"
     },
+    "pmix server's listener thread failed to start": {
+        "zh": "MPI/PMIx 监听线程启动失败",
+        "suggestion": "当前运行环境可能限制了 socket 权限；建议改用串行，或在允许网络套接字的容器/主机上运行并行",
+        "severity": "error",
+    },
+    "pmix_ifinit: socket() failed with errno=1": {
+        "zh": "PMIx socket 初始化失败（权限不足）",
+        "suggestion": "检查容器沙箱/安全策略（seccomp/gVisor）是否限制 AF_INET socket，必要时切换到支持 MPI 的运行环境",
+        "severity": "error",
+    },
 }
 
 

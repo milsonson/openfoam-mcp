@@ -187,6 +187,58 @@ def test_run_parallel_auto_mesh_and_fallback_to_serial_when_parallel_deps_missin
     assert "✅ 串行求解完成" in result
 
 
+def test_run_parallel_fallbacks_to_serial_when_mpirun_runtime_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    case_path = tmp_path / "case_parallel_runtime_fail"
+    _create_case(case_path, with_mesh=True, with_block_mesh_dict=True)
+
+    def fake_resolve_command(cmd: str) -> str | None:
+        return {
+            "simpleFoam": "/opt/openfoam/bin/simpleFoam",
+            "decomposePar": "/opt/openfoam/bin/decomposePar",
+            "mpirun": "/usr/bin/mpirun",
+            "reconstructPar": "/opt/openfoam/bin/reconstructPar",
+        }.get(cmd)
+
+    def fake_decompose_case(*_args, **_kwargs) -> RunResult:
+        return _completed_result()
+
+    def fake_run_parallel(*_args, **_kwargs) -> RunResult:
+        return _failed_result(
+            error="The PMIx server's listener thread failed to start",
+            stderr=(
+                "The PMIx server's listener thread failed to start.\n"
+                "pmix_ifinit: socket() failed with errno=1\n"
+            ),
+        )
+
+    serial_called = {"count": 0}
+
+    def fake_run_solver(*_args, **_kwargs) -> RunResult:
+        serial_called["count"] += 1
+        return _completed_result(residuals={"U": 1e-7, "p": 1e-6})
+
+    monkeypatch.setattr("src.tools.case_tools.resolve_openfoam_command", fake_resolve_command)
+    monkeypatch.setattr("src.tools.case_tools.decompose_case", fake_decompose_case)
+    monkeypatch.setattr("src.tools.case_tools.run_parallel", fake_run_parallel)
+    monkeypatch.setattr("src.tools.case_tools.run_solver", fake_run_solver)
+
+    result = openfoam_run_parallel(
+        RunParallelInput(
+            case_path=str(case_path),
+            n_processors=2,
+            solver="simpleFoam",
+            timeout=120,
+        )
+    )
+
+    assert serial_called["count"] == 1
+    assert "并行求解失败，回退到串行求解" in result
+    assert "✅ 串行求解完成" in result
+
+
 def test_core_run_solver_persists_log_file_for_status_tools(tmp_path: Path, monkeypatch) -> None:
     case_path = tmp_path / "core_solver_case"
     _create_case(case_path)
@@ -319,4 +371,58 @@ def test_workflow_parallel_fallbacks_to_serial_when_metis_is_missing(
     assert payload["solver_run"]["status"] == RunStatus.COMPLETED.value
     assert payload["solver_run"]["execution_mode"] == "serial_fallback"
     assert payload["solver_run"]["fallback_reason"] == "missing_metis_decomposer"
+    assert "parallel_fallback_to_serial" in payload["warnings"]
+
+
+def test_workflow_parallel_fallbacks_to_serial_when_mpi_runtime_unavailable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    case_path = tmp_path / "workflow_parallel_runtime_case"
+
+    def fake_resolve_command(cmd: str) -> str | None:
+        return {
+            "simpleFoam": "/opt/openfoam/bin/simpleFoam",
+            "mpirun": "/usr/bin/mpirun",
+            "decomposePar": "/opt/openfoam/bin/decomposePar",
+            "reconstructPar": "/opt/openfoam/bin/reconstructPar",
+        }.get(cmd)
+
+    def fake_decompose_case(*_args, **_kwargs) -> RunResult:
+        return _completed_result()
+
+    def fake_run_parallel(*_args, **_kwargs) -> RunResult:
+        return _failed_result(
+            error="The PMIx server's listener thread failed to start",
+            stderr="pmix_ifinit: socket() failed with errno=1",
+        )
+
+    serial_called = {"count": 0}
+
+    def fake_run_solver(*_args, **_kwargs) -> RunResult:
+        serial_called["count"] += 1
+        return _completed_result(residuals={"U": 1e-6, "p": 1e-5})
+
+    monkeypatch.setattr("src.tools.workflow_tools.resolve_openfoam_command", fake_resolve_command)
+    monkeypatch.setattr("src.tools.workflow_tools.decompose_case", fake_decompose_case)
+    monkeypatch.setattr("src.tools.workflow_tools.run_parallel", fake_run_parallel)
+    monkeypatch.setattr("src.tools.workflow_tools.run_solver", fake_run_solver)
+
+    result = openfoam_run_workflow_from_prompt(
+        RunWorkflowFromPromptInput(
+            description="模拟水在直径5cm、长度50cm的管道中以1m/s流动",
+            case_path=str(case_path),
+            run_mesh=False,
+            run_solver=True,
+            run_parallel=True,
+            auto_apply_stability_fixes=False,
+            response_format="json",
+        )
+    )
+    payload = json.loads(result)
+
+    assert serial_called["count"] == 1
+    assert payload["solver_run"]["status"] == RunStatus.COMPLETED.value
+    assert payload["solver_run"]["execution_mode"] == "serial_fallback"
+    assert payload["solver_run"]["fallback_reason"] == "mpi_runtime_unavailable"
     assert "parallel_fallback_to_serial" in payload["warnings"]

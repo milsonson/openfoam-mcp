@@ -182,12 +182,13 @@ def _extract_application(control_dict: str) -> Optional[str]:
 
 def _probe_command_runtime_issue(command: str, resolved_path: str) -> Optional[str]:
     """Probe command load-time/runtime issues that `which` cannot detect."""
-    if command != "decomposePar":
+    if command not in {"decomposePar", "mpirun"}:
         return None
 
+    probe_args = ["-help"] if command == "decomposePar" else ["--version"]
     try:
         proc = subprocess.run(
-            [resolved_path, "-help"],
+            [resolved_path, *probe_args],
             capture_output=True,
             text=True,
             timeout=5,
@@ -197,8 +198,21 @@ def _probe_command_runtime_issue(command: str, resolved_path: str) -> Optional[s
         return None
 
     output = f"{proc.stdout}\n{proc.stderr}".lower()
-    if "libmetisdecomp.so" in output and "metis" in output:
-        return "运行时缺少 libmetisDecomp.so（并行分解可能失败）"
+    if command == "decomposePar":
+        if "libmetisdecomp.so" in output and "metis" in output:
+            return "运行时缺少 libmetisDecomp.so（并行分解可能失败）"
+        return None
+
+    if (
+        "pmix_ifinit" in output
+        and "socket() failed" in output
+        and ("errno=1" in output or "operation not permitted" in output)
+    ) or "pmix server's listener thread failed to start" in output:
+        return "PMIx listener 初始化失败（socket 权限受限，mpirun 并行不可用）"
+
+    if "operation not permitted" in output and ("pmix" in output or "prte" in output):
+        return "MPI 运行时权限受限（Operation not permitted），并行求解不可用"
+
     return None
 
 
@@ -557,7 +571,7 @@ def openfoam_preflight_check(params: PreflightCheckInput) -> str:
         path = which(cmd)
         required = cmd in required_commands
         runtime_issue: Optional[str] = None
-        if path and cmd == "decomposePar" and (params.profile == "parallel" or params.n_processors):
+        if path and cmd in {"decomposePar", "mpirun"} and (params.profile == "parallel" or params.n_processors):
             runtime_issue = _probe_command_runtime_issue(cmd, path)
 
         status = "ok" if path else ("error" if required else "warning")

@@ -83,6 +83,22 @@ def _contains_missing_metis_error(*messages: Optional[str]) -> bool:
     return "libmetisdecomp.so" in haystack or ("metis" in haystack and "decompose" in haystack)
 
 
+def _contains_mpi_runtime_error(*messages: Optional[str]) -> bool:
+    """Detect MPI runtime initialization failures (e.g., PMIx listener/socket)."""
+    haystack = "\n".join(msg for msg in messages if msg).lower()
+    pmix_listener_failure = "pmix server's listener thread failed to start" in haystack
+    pmix_socket_permission = (
+        "pmix_ifinit" in haystack
+        and "socket() failed" in haystack
+        and ("errno=1" in haystack or "operation not permitted" in haystack)
+    )
+    generic_mpi_permission = (
+        ("operation not permitted" in haystack)
+        and ("pmix" in haystack or "prte" in haystack or "mpirun" in haystack)
+    )
+    return pmix_listener_failure or pmix_socket_permission or generic_mpi_permission
+
+
 class KPISummary(TypedDict):
     """Key metrics extracted from workflow execution."""
 
@@ -1227,13 +1243,28 @@ def openfoam_run_workflow_from_prompt(params: RunWorkflowFromPromptInput) -> str
                     solver_result["status"] = parallel_result.status.value
                     solver_result["solve"] = _run_result_to_dict(parallel_result)
 
-                    if parallel_result.status == RunStatus.COMPLETED and reconstruct_cmd:
-                        reconstruct_result = reconstruct_case(
+                    if parallel_result.status == RunStatus.COMPLETED:
+                        if reconstruct_cmd:
+                            reconstruct_result = reconstruct_case(
+                                case_path=resolved_case_path,
+                                latest_time=False,
+                                timeout=min(params.timeout, 900.0),
+                            )
+                            solver_result["reconstruct"] = _run_result_to_dict(reconstruct_result)
+                    elif _contains_mpi_runtime_error(
+                        parallel_result.error_message,
+                        parallel_result.stderr,
+                        parallel_result.stdout,
+                    ):
+                        serial_result = run_solver(
                             case_path=resolved_case_path,
-                            latest_time=False,
-                            timeout=min(params.timeout, 900.0),
+                            solver=solver_cmd,
+                            timeout=params.timeout,
                         )
-                        solver_result["reconstruct"] = _run_result_to_dict(reconstruct_result)
+                        solver_result["status"] = serial_result.status.value
+                        solver_result["solve"] = _run_result_to_dict(serial_result)
+                        solver_result["execution_mode"] = "serial_fallback"
+                        solver_result["fallback_reason"] = "mpi_runtime_unavailable"
                 else:
                     fallback_reason = "decompose_failed"
                     if _contains_missing_metis_error(

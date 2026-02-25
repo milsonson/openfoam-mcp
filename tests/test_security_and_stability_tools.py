@@ -1059,6 +1059,31 @@ def test_preflight_parallel_detects_metis_runtime_library_issue(monkeypatch) -> 
     assert "libmetisDecomp.so" in decompose.get("detail", "")
 
 
+def test_preflight_parallel_detects_mpirun_runtime_issue(monkeypatch) -> None:
+    """Parallel preflight should flag mpirun runtime failures like PMIx listener errors."""
+    monkeypatch.setattr("src.tools.stability_tools.which", lambda cmd: f"/usr/bin/{cmd}")
+    monkeypatch.setattr(
+        "src.tools.stability_tools._probe_command_runtime_issue",
+        lambda command, _path: (
+            "PMIx listener 初始化失败（socket() Operation not permitted）"
+            if command == "mpirun"
+            else None
+        ),
+        raising=False,
+    )
+
+    result = openfoam_preflight_check(
+        PreflightCheckInput(
+            profile="parallel",
+            response_format="json",
+        )
+    )
+    payload = json.loads(result)
+    mpirun = next(item for item in payload["command_checks"] if item["command"] == "mpirun")
+    assert mpirun["status"] == "error"
+    assert "PMIx listener" in mpirun.get("detail", "")
+
+
 def test_preflight_detects_cyclic_patch_without_neighbour_patch(tmp_path: Path) -> None:
     """Preflight should block cases with cyclic patch definitions missing neighbourPatch."""
     case_path = tmp_path / "case_cyclic_missing_neighbor"

@@ -74,6 +74,22 @@ def _contains_missing_metis_error(*messages: Optional[str]) -> bool:
     return "metis" in haystack and "libmetisdecomp.so" in haystack
 
 
+def _contains_mpi_runtime_error(*messages: Optional[str]) -> bool:
+    """Detect MPI runtime initialization failures (e.g., PMIx listener/socket)."""
+    haystack = "\n".join(msg for msg in messages if msg).lower()
+    pmix_listener_failure = "pmix server's listener thread failed to start" in haystack
+    pmix_socket_permission = (
+        "pmix_ifinit" in haystack
+        and "socket() failed" in haystack
+        and ("errno=1" in haystack or "operation not permitted" in haystack)
+    )
+    generic_mpi_permission = (
+        ("operation not permitted" in haystack)
+        and ("pmix" in haystack or "prte" in haystack or "mpirun" in haystack)
+    )
+    return pmix_listener_failure or pmix_socket_permission or generic_mpi_permission
+
+
 def _validate_allowed_case_path(case_path: str) -> str:
     """Compatibility wrapper for shared case path validator."""
     return validate_allowed_case_path(case_path)
@@ -1831,6 +1847,35 @@ def openfoam_run_parallel(params: RunParallelInput) -> str:
                 lines.append("```")
                 lines.append(solver_result.stderr[-1000:])
                 lines.append("```")
+
+            if _contains_mpi_runtime_error(
+                solver_result.error_message,
+                solver_result.stderr,
+                solver_result.stdout,
+            ):
+                lines.append("")
+                lines.append("⚠️ 并行求解失败，回退到串行求解（检测到 MPI/PMIx 运行时异常）")
+                serial_result = run_solver(
+                    case_path=str(case_path),
+                    solver=solver_cmd,
+                    timeout=params.timeout,
+                )
+                if serial_result.status == RunStatus.COMPLETED:
+                    lines.append("✅ 串行求解完成")
+                    lines.append(f"**耗时**: {serial_result.duration_seconds:.1f} 秒")
+                else:
+                    lines.append("❌ 串行求解失败")
+                    lines.append(f"**耗时**: {serial_result.duration_seconds:.1f} 秒")
+                    if serial_result.error_message:
+                        lines.append(f"**错误**: {serial_result.error_message}")
+
+                if serial_result.final_residuals:
+                    lines.append("")
+                    lines.append("## 串行最终残差")
+                    for field, residual in serial_result.final_residuals.items():
+                        lines.append(f"- {field}: {residual:.2e}")
+
+                return _truncate("\n".join(lines))
 
             return _truncate("\n".join(lines))
 
